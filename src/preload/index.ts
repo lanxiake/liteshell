@@ -64,6 +64,7 @@ const api: Api = {
   pickFile: (filters) => ipcRenderer.invoke('dialog:pickFile', filters),
   importFinalshell: () => ipcRenderer.invoke('import:finalshell'),
   importFinalshellFile: (folderId) => ipcRenderer.invoke('import:finalshellFile', folderId),
+  setupPasswordless: (id, secret) => ipcRenderer.invoke('conn:passwordless', id, secret),
   exportConnections: (passphrase) => ipcRenderer.invoke('conn:export', passphrase),
   exportConnection: (id, passphrase) => ipcRenderer.invoke('conn:exportOne', id, passphrase),
   exportFolder: (id, passphrase) => ipcRenderer.invoke('conn:exportFolder', id, passphrase),

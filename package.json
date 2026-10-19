@@ -1,6 +1,6 @@
 {
   "name": "liteshell",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Lightweight, fast, cross-platform SSH / SFTP terminal",
   "author": "lanxk",
   "license": "MIT",
@@ -36,6 +36,7 @@
     "test:gate": "node scripts/test-gate.mjs",
     "test:sealed": "node scripts/test-sealed.mjs",
     "test:backup": "node scripts/test-backup.mjs",
+    "test:passwordless": "node scripts/test-passwordless.mjs",
     "test:monitor": "node scripts/test-monitor.mjs",
     "test:textfile": "node scripts/test-textfile.mjs",
     "test:commands": "node scripts/test-commands.mjs",

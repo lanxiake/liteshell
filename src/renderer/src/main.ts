@@ -580,6 +580,7 @@ function treeMenu(ev: MouseEvent, item: Folder | Connection, isFolder: boolean, 
         { label: '编辑', run: () => connDialog(item as Connection, null) },
         { label: '重命名', run: () => renameConnection(item as Connection) },
         { label: '复制 IP', run: () => copyText((item as Connection).host, 'IP') },
+        { label: '配置本机免密登录…', run: () => void passwordlessDialog(item as Connection) },
         { label: '导出…', run: () => void exportOneDialog(item as Connection) },
         { label: '复制', run: () => void api.duplicateConnection(id).then(refreshStore) },
         { sep: true },
@@ -598,6 +599,43 @@ function renameConnection(conn: Connection): void {
     await api.saveConnection({ ...rest, name }, null)
     await refreshStore()
   })
+}
+
+async function passwordlessDialog(conn: Connection): Promise<void> {
+  const picked = await withSecret(conn, '配置')
+  if (!picked) return
+  try {
+    const r = await api.setupPasswordless(conn.id, picked.secret)
+    // The setup just proved the password works, so it is safe to remember now.
+    if (picked.secret && picked.remember) await persistSecret(conn, picked.secret)
+    log('info', `[${conn.name}] 已配置免密登录：ssh ${r.host}`)
+    const body = el('div')
+    body.style.display = 'grid'
+    body.style.gap = '6px'
+    body.append(
+      el('div', '', `本机终端里现在可以直接运行：ssh ${r.host}`),
+      el('div', 'mon-sub', `${r.username}@${r.host}:${r.port}`),
+      el('div', 'mon-sub', `私钥 ${r.keyPath}`),
+      el('div', 'mon-sub', `配置 ${r.configPath}`),
+      el(
+        'div',
+        'mon-sub',
+        r.added
+          ? '公钥已写入服务器的 authorized_keys。'
+          : '服务器上原来就有这把公钥，没有重复写入。'
+      ),
+      el('div', 'mon-sub', '私钥没有口令，请像密码一样保管它。')
+    )
+    showModal('免密登录已配置', body, [
+      { label: '复制命令', onClick: () => copyText(`ssh ${r.host}`, '命令') },
+      { label: '好', primary: true, onClick: closeModal }
+    ])
+  } catch (err) {
+    log('error', `[${conn.name}] 配置免密登录失败：${(err as Error).message}`)
+    showModal('配置失败', el('div', '', (err as Error).message), [
+      { label: '好', primary: true, onClick: closeModal }
+    ])
+  }
 }
 
 async function exportOneDialog(conn: Connection): Promise<void> {
@@ -1726,7 +1764,8 @@ function commandPalette(): void {
  * if the user backed out.
  */
 async function withSecret(
-  conn: Connection
+  conn: Connection,
+  submitLabel = '连接'
 ): Promise<{ conn: Connection; secret?: string; remember?: boolean } | null> {
   log('info', `[${conn.name}] 连接 ${conn.username}@${conn.host}:${conn.port}（${conn.authType}）`)
 
@@ -1776,7 +1815,7 @@ async function withSecret(
 
     showModal(`${conn.name} — 需要密码`, body, [
       { label: '取消', onClick: () => done(null) },
-      { label: '连接', primary: true, onClick: submit }
+      { label: submitLabel, primary: true, onClick: submit }
     ])
     secret.focus()
     secret.addEventListener('keydown', (ev) => {

@@ -313,6 +313,17 @@ export interface SessionInfo {
   error?: string
 }
 
+/** Outcome of configuring plain `ssh <host>` on this machine. */
+export interface PasswordlessResult {
+  host: string
+  port: number
+  username: string
+  keyPath: string
+  configPath: string
+  /** false when the server already had this key in authorized_keys. */
+  added: boolean
+}
+
 /** Renderer -> main invoke channels. */
 export interface Api {
   getStore(): Promise<Store>
@@ -418,6 +429,9 @@ export interface Api {
   exportConnection(id: string, passphrase?: string): Promise<ExportReport | null>
   /** A bundle for one folder and everything below it. */
   exportFolder(id: string, passphrase?: string): Promise<ExportReport | null>
+  /** Installs LiteShell's local key on the server and writes the ssh config
+   *  block, so `ssh <host>` works here without a password afterwards. */
+  setupPasswordless(id: string, secret?: string): Promise<PasswordlessResult>
   /** `path` is only for the second call, after a `needsPassphrase` answer. */
   importConnections(
     passphrase?: string,

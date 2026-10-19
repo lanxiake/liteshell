@@ -25,6 +25,7 @@ import { CliServer } from './cli-server'
 import { AgentRunner, clearSpill } from './agent'
 import { listModels } from './agent-providers'
 import { importFinalshell } from './finalshell'
+import { setupPasswordless } from './passwordless'
 import {
   addKey,
   duplicateConnection,
@@ -409,6 +410,15 @@ function registerIpc(): void {
       missing
     }
   }
+
+  // One-click `ssh <host>`: the stored secret (or the one just typed) authorises
+  // installing the local public key, and the ssh config block is written after
+  // a key-only login is proven.
+  ipcMain.handle('conn:passwordless', (_e, id: string, secret?: string) => {
+    const conn = store().connections.find((c) => c.id === id)
+    if (!conn) throw new Error(`未知连接: ${id}`)
+    return setupPasswordless(conn, secret)
+  })
 
   ipcMain.handle('conn:export', (e, passphrase = '') =>
     exportToFile(

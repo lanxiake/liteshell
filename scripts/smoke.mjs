@@ -1458,6 +1458,17 @@ async function main() {
   )
   await evaluate(cdp, `document.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))`)
 
+  const connMenu = await evaluate(
+    cdp,
+    `(() => {
+       const node = document.querySelector('.node[data-kind="connection"]')
+       node.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 180, clientY: 220 }))
+       return [...document.querySelectorAll('#menu > div')].map(d => d.textContent).join('|')
+     })()`
+  )
+  check('连接右键有配置免密登录', /配置本机免密登录/.test(connMenu), connMenu)
+  await evaluate(cdp, `document.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))`)
+
   /* ---------------- pick a key in the connection editor ---------------- */
 
   // Identified by an option carrying the library path: the modal has several selects.
