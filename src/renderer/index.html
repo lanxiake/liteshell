@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' ws:"
+    />
+    <title>LiteShell</title>
+  </head>
+  <body>
+    <header id="titlebar">
+      <span class="brand">LiteShell</span>
+      <span class="spacer"></span>
+      <button id="btn-theme" class="icon-btn" title="切换主题">🎨</button>
+      <button id="btn-log" class="icon-btn txt" title="查看日志">日志</button>
+      <button id="btn-quick" class="icon-btn" title="命令面板">⌘</button>
+      <button id="btn-keyring" class="icon-btn" title="私钥管理">🔑</button>
+      <button id="btn-keys" class="icon-btn" title="快捷键一览 (Ctrl+/)">⌨</button>
+      <button id="btn-settings" class="icon-btn" title="设置">⚙</button>
+    </header>
+
+    <div id="body">
+      <aside id="sidebar">
+        <div class="side-head">
+          <span>连接</span>
+          <span class="spacer"></span>
+          <button
+            id="btn-import"
+            class="icon-btn txt"
+            title="从 FinalShell 导入：安装目录，或右键 → 导出得到的目录"
+          >
+            导入
+          </button>
+          <button id="btn-new-folder" class="icon-btn" title="新建文件夹">🗀</button>
+          <button id="btn-new-conn" class="icon-btn" title="新建连接">＋</button>
+        </div>
+        <div id="tree" class="scroll"></div>
+      </aside>
+      <div id="resizer"></div>
+      <main id="main">
+        <div id="tabs"></div>
+        <div id="panes"></div>
+      </main>
+    </div>
+
+    <div id="statusbar">
+      <span id="status-text">就绪</span>
+      <span class="spacer"></span>
+      <span id="status-host"></span>
+    </div>
+
+    <div id="overlay" hidden></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

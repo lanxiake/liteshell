@@ -1,0 +1,67 @@
+{
+  "name": "liteshell",
+  "version": "0.1.0",
+  "description": "Lightweight, fast, cross-platform SSH / SFTP terminal",
+  "author": "lanxk",
+  "license": "MIT",
+  "homepage": "https://github.com/lanxiake/liteshell",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lanxiake/liteshell.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lanxiake/liteshell/issues"
+  },
+  "keywords": [
+    "ssh",
+    "sftp",
+    "terminal",
+    "electron",
+    "finalshell"
+  ],
+  "main": "./out/main/index.js",
+  "desktopName": "liteshell.desktop",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "start": "electron-vite preview",
+    "build": "electron-vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "icon": "node scripts/make-icon.mjs",
+    "smoke": "electron-vite build && node scripts/smoke.mjs",
+    "dist:win": "electron-vite build && electron-builder --win --publish never",
+    "dist:mac": "electron-vite build && electron-builder --mac --publish never",
+    "dist:linux": "electron-vite build && electron-builder --linux --publish never",
+    "dist:linux-tar": "electron-vite build && electron-builder --linux tar.xz --publish never",
+    "test:import": "node scripts/test-import.mjs",
+    "test:gate": "node scripts/test-gate.mjs",
+    "test:sealed": "node scripts/test-sealed.mjs",
+    "test:backup": "node scripts/test-backup.mjs",
+    "test:monitor": "node scripts/test-monitor.mjs",
+    "test:textfile": "node scripts/test-textfile.mjs",
+    "test:commands": "node scripts/test-commands.mjs",
+    "test:alerts": "node scripts/test-alerts.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.135.0",
+    "openai": "^7.34.0",
+    "ssh2": "^1.17.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/ssh2": "^1.15.5",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-search": "^0.16.0",
+    "@xterm/addon-web-links": "^0.12.0",
+    "@xterm/xterm": "^6.0.0",
+    "electron": "^44.7.2",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^5.0.0",
+    "typescript": "^5.9.0",
+    "vite": "^7.0.0"
+  },
+  "allowScripts": {
+    "electron@44.7.2": true,
+    "esbuild@0.25.12": true,
+    "esbuild@0.28.2": true
+  }
+}

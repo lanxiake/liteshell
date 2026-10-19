@@ -1,0 +1,58 @@
+appId: dev.lanxk.liteshell
+productName: LiteShell
+copyright: Copyright © 2026 lanxk
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - out/**/*
+  - package.json
+  # The window icon on Linux (Windows uses the exe icon instead).
+  - build/icon.png
+
+compression: maximum
+electronLanguages:
+  - zh-CN
+  - en-US
+
+# ssh2 ships optional native bindings we do not build; its pure-JS path is used.
+asarUnpack:
+  - node_modules/ssh2/**
+
+win:
+  target:
+    - target: nsis
+      # arm64 needs `--arm64`; on Windows the extra pass keeps getting its
+      # staging-dir rename refused (EPERM, antivirus holding freshly written
+      # files), so x64 is what builds unattended.
+      arch: [x64]
+  artifactName: ${productName}-${version}-${arch}-setup.${ext}
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  shortcutName: LiteShell
+
+mac:
+  target:
+    - target: dmg
+      arch: [x64, arm64]
+  category: public.app-category.developer-tools
+  artifactName: ${productName}-${version}-${arch}.${ext}
+
+linux:
+  target:
+    - target: AppImage
+      arch: [x64]
+    - target: deb
+      arch: [x64]
+  category: Development
+  maintainer: lanxk
+  # Match Electron's app_id/WM_CLASS (from package.json desktopName) to the
+  # installed .desktop file, or Ubuntu shows the window with no icon.
+  syncDesktopName: true
+  artifactName: ${productName}-${version}-${arch}.${ext}
