@@ -569,6 +569,9 @@ function treeMenu(ev: MouseEvent, item: Folder | Connection, isFolder: boolean, 
         { label: '新建连接', run: () => connDialog(null, id) },
         { label: '新建子文件夹', run: () => folderDialog(null, id) },
         { sep: true },
+        { label: '导入 FinalShell 连接文件…', run: () => void importFinalshellDialog(id, true) },
+        { label: '导出此文件夹…', run: () => void exportFolderDialog(item as Folder) },
+        { sep: true },
         { label: '重命名', run: () => folderDialog(item as Folder, parentId) },
         { label: '删除', danger: true, run: () => confirmDelete('文件夹', `删除文件夹「${item.name}」及其中所有连接？`, () => api.deleteFolder(id)) }
       ]
@@ -616,6 +619,46 @@ async function exportOneDialog(conn: Connection): Promise<void> {
     ])
   } catch (err) {
     log('error', `导出失败：${(err as Error).message}`)
+  }
+}
+
+async function exportFolderDialog(folder: Folder): Promise<void> {
+  try {
+    const passphrase = await askPassphrase({
+      title: `导出文件夹「${folder.name}」`,
+      note:
+        '会导出这个文件夹和它下面的所有子文件夹、连接、用到的私钥。' +
+        '设一个口令：密码和私钥口令会用它在文件里加密，导入时输同一个口令就不用再输。留空则不带走密码。',
+      confirm: '导出',
+      twice: true
+    })
+    if (passphrase === null) return
+    const report = await api.exportFolder(folder.id, passphrase)
+    if (!report) return
+    log('info', `已导出文件夹「${folder.name}」：${report.connections} 条连接 → ${report.path}`)
+    const body = el('div')
+    body.style.display = 'grid'
+    body.style.gap = '6px'
+    body.append(
+      el('div', '', `连接 ${report.connections} 条，私钥 ${report.keys} 个`),
+      el('div', 'mon-sub', report.path),
+      el(
+        'div',
+        'mon-sub',
+        report.passwords
+          ? `${report.passwords} 个密码 / 私钥口令已加密写进文件。`
+          : '文件里不含密码——换台机器导入后首次连接需要补录。'
+      )
+    )
+    for (const name of report.missing) {
+      body.append(el('div', 'mon-sub', `⚠ ${name} 的私钥文件已丢失，没有导出`))
+    }
+    showModal('导出完成', body, [{ label: '好', primary: true, onClick: closeModal }])
+  } catch (err) {
+    log('error', `导出失败：${(err as Error).message}`)
+    showModal('导出失败', el('div', '', (err as Error).message), [
+      { label: '好', primary: true, onClick: closeModal }
+    ])
   }
 }
 
@@ -1165,7 +1208,8 @@ function settingsDialog(): void {
 /** One entry point for both directions, since they only differ by which dialog opens. */
 function transferMenu(ev: MouseEvent): void {
   showMenu(ev.clientX, ev.clientY, [
-    { label: '从 FinalShell 导入…', run: () => void importFinalshellDialog() },
+    { label: '从 FinalShell 导入目录…', run: () => void importFinalshellDialog() },
+    { label: '导入 FinalShell 连接文件…', run: () => void importFinalshellDialog(null, true) },
     { sep: true },
     { label: '导入 LiteShell 备份…', run: () => void importBundleDialog() },
     { label: '导出全部连接…', run: () => void exportBundleDialog() }
@@ -1341,13 +1385,16 @@ async function importBundleDialog(): Promise<void> {
   }
 }
 
-async function importFinalshellDialog(): Promise<void> {
-  const summary = await api.importFinalshell()
+async function importFinalshellDialog(folderId: string | null = null, singleFile = false): Promise<void> {
+  const summary = singleFile ? await api.importFinalshellFile(folderId) : await api.importFinalshell()
   if (!summary) return
   await refreshStore()
+  const where = folderId ? store.folders.find((f) => f.id === folderId)?.name : ''
   log(
     'info',
-    `导入 FinalShell：${summary.folders} 个文件夹 / ${summary.connections} 条连接 / ${summary.keys} 个私钥` +
+    `导入 FinalShell${where ? `到「${where}」` : ''}：${summary.folders} 个文件夹 / ${summary.connections} 条连接 / ` +
+      `${summary.keys} 个私钥` +
+      (summary.passwords ? ` / 恢复 ${summary.passwords} 个密码` : '') +
       (summary.needsPassword ? `，${summary.needsPassword} 条需要补录密码` : '')
   )
   for (const warning of summary.warnings) log('warn', `导入提示：${warning}`)
@@ -1357,10 +1404,13 @@ async function importFinalshellDialog(): Promise<void> {
     ['连接', String(summary.connections)],
     ['导出的私钥', `${summary.keys} 个`]
   ]
+  if (summary.passwords) {
+    rows.push(['已恢复密码', `${summary.passwords} 个（已存进系统钥匙串，连接时不用再输）`])
+  }
   if (summary.needsPassword) {
     rows.push([
       '需要补录密码',
-      `${summary.needsPassword} 个连接（FinalShell 的密码是加密存储的，导不出来）`
+      `${summary.needsPassword} 个连接（配置里没有密码，或密文解不开）`
     ])
   }
   if (summary.skipped) rows.push(['已跳过（非 SSH）', String(summary.skipped)])

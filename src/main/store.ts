@@ -128,8 +128,14 @@ export function upsertConnection(conn: Connection, secret: string | null): Conne
 }
 
 /** Merge an import in place. Existing ids are updated rather than duplicated, and
- *  a connection that already has a saved password keeps it. */
-export function mergeImport(folders: Folder[], connections: Connection[]): void {
+ *  a connection that already has a saved password keeps it. `secrets` carries
+ *  plaintext recovered elsewhere (FinalShell's encrypted passwords); those are
+ *  sealed into this machine's keychain on the way in. */
+export function mergeImport(
+  folders: Folder[],
+  connections: Connection[],
+  secrets: Record<string, string> = {}
+): void {
   const s = store()
   for (const folder of folders) {
     const i = s.folders.findIndex((f) => f.id === folder.id)
@@ -137,9 +143,11 @@ export function mergeImport(folders: Folder[], connections: Connection[]): void 
     else s.folders.push(folder)
   }
   for (const conn of connections) {
+    const plain = secrets[conn.id]
+    const sealed = plain ? encryptSecret(plain) : undefined
     const i = s.connections.findIndex((c) => c.id === conn.id)
-    if (i >= 0) s.connections[i] = { ...conn, secret: s.connections[i].secret }
-    else s.connections.push(conn)
+    if (i >= 0) s.connections[i] = { ...conn, secret: s.connections[i].secret ?? sealed }
+    else s.connections.push(sealed ? { ...conn, secret: sealed } : conn)
   }
   persist()
 }
@@ -365,14 +373,32 @@ export function exportBundle(
   /** When set, only these connections travel — the "export this connection"
    *  menu item. Nothing else from this machine goes along: no other keys, no
    *  settings, no model config. */
-  onlyIds?: string[]
+  onlyIds?: string[],
+  /** Export one folder and everything below it. The folder becomes the root of
+   *  the file, so importing it elsewhere does not leave a dangling parent. */
+  folderRoot?: string
 ): {
   bundle: BackupBundle
   missing: string[]
   passwords: number
 } {
   const s = store()
-  const keep = onlyIds ? new Set(onlyIds) : null
+  let scopeIds = onlyIds
+  let folderIds: Set<string> | null = null
+  if (folderRoot) {
+    folderIds = new Set()
+    const collect = (id: string): void => {
+      if (folderIds!.has(id)) return
+      folderIds!.add(id)
+      for (const f of s.folders) if (f.parentId === id) collect(f.id)
+    }
+    collect(folderRoot)
+    scopeIds = s.connections
+      .filter((c) => c.folderId && folderIds!.has(c.folderId))
+      .map((c) => c.id)
+  }
+  const keep = scopeIds ? new Set(scopeIds) : null
+  const scoped = keep !== null
   const picked = keep ? s.connections.filter((c) => keep.has(c.id)) : s.connections
   const missing: string[] = []
   const seen = new Map<string, KeyBlob>() // path -> blob, so one file is stored once
@@ -397,7 +423,7 @@ export function exportBundle(
   }
 
   // Keys nothing references yet still travel: that is the whole point of filing them.
-  if (!keep) for (const k of s.keys) add(k.path, k.id, k)
+  if (!scoped) for (const k of s.keys) add(k.path, k.id, k)
 
   const connections = picked.map((c) => {
     const { secret: _drop, hasSecret: _drop2, ...rest } = c
@@ -420,7 +446,7 @@ export function exportBundle(
   }
   if (Object.keys(keySecrets).length) secrets.keys = keySecrets
   const llm = llmSettings()
-  if (!keep && llm.apiKey) secrets.llmKey = llm.apiKey
+  if (!scoped && llm.apiKey) secrets.llmKey = llm.apiKey
   const passwords =
     Object.keys(byId).length + Object.keys(keySecrets).length + (secrets.llmKey ? 1 : 0)
 
@@ -429,12 +455,18 @@ export function exportBundle(
     kind: 'liteshell-backup',
     version: 1,
     exportedAt: Date.now(),
-    // One connection lands in the root on the other side; carrying a folder
-    // without its ancestors would only make a dangling one.
-    folders: keep ? [] : s.folders,
+    // A scoped export carries only its own folders. The folder being exported
+    // becomes the root so it never arrives with a parent that stayed behind.
+    folders: folderIds
+      ? s.folders
+          .filter((f) => folderIds!.has(f.id))
+          .map((f) => (f.id === folderRoot ? { ...f, parentId: null } : f))
+      : keep
+        ? []
+        : s.folders,
     connections,
     keys,
-    ...(keep
+    ...(scoped
       ? {
           knownHosts: s.knownHosts.filter((h) =>
             picked.some((c) => c.host === h.host && c.port === h.port)

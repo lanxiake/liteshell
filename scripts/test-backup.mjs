@@ -167,6 +167,44 @@ check('对面导入后只有这一条，且密码可用',
     oneDst.publicStore().connections[0].id === 'c1' &&
     oneDst.secretOf(oneDst.store().connections[0]) === 'root-password')
 
+/* ---------------- one folder and its subtree ---------------- */
+
+const [c1pub, c2pub] = src.publicStore().connections
+const strip = ({ hasSecret: _h, secret: _s, ...rest }) => rest
+src.upsertFolder({ id: 'f1', name: '生产环境', parentId: null })
+src.upsertFolder({ id: 'f2', name: '华东', parentId: 'f1' })
+src.upsertConnection({ ...strip(c1pub), folderId: 'f1' }, null)
+src.upsertConnection({ ...strip(c2pub), folderId: 'f2' }, null)
+
+const folderBundle = src.exportBundle('口令 abc', undefined, 'f1')
+check('文件夹导出只带这棵子树',
+  folderBundle.bundle.folders.length === 2 &&
+    folderBundle.bundle.connections.map((c) => c.id).sort().join() === 'c1,c2',
+  JSON.stringify({
+    folders: folderBundle.bundle.folders.map((f) => f.id),
+    conns: folderBundle.bundle.connections.map((c) => c.id)
+  }))
+check('导出的文件夹成为根，不会悬空',
+  folderBundle.bundle.folders.find((f) => f.id === 'f1')?.parentId === null &&
+    folderBundle.bundle.folders.find((f) => f.id === 'f2')?.parentId === 'f1')
+check('文件夹导出不带模型配置和界面设置',
+  !folderBundle.bundle.llm && !folderBundle.bundle.settings)
+check('文件夹导出只带用到的密码', folderBundle.passwords === 1, String(folderBundle.passwords))
+
+const dstF = await machine(join(work, 'dstF'))
+dstF.importBundle(folderBundle.bundle, join(work, 'dstF', 'keys'), '口令 abc')
+const dstFolders = dstF.publicStore().folders
+check('文件夹结构在对面重建',
+  dstFolders.length === 2 &&
+    dstFolders.find((f) => f.id === 'f1')?.parentId === null &&
+    dstFolders.find((f) => f.id === 'f2')?.parentId === 'f1',
+  JSON.stringify(dstFolders))
+check('子树之外的连接没有跟过去',
+  dstF.publicStore().connections.length === 2 &&
+    dstF.publicStore().connections.every((c) => c.id !== 'c3'))
+check('文件夹里的密码导入后可用',
+  dstF.secretOf(dstF.store().connections.find((c) => c.id === 'c1')) === 'root-password')
+
 /* ---------------- a key that travels with the file ---------------- */
 
 writeFileSync(join(srcDir, 'id_ed25519'), '-----BEGIN OPENSSH PRIVATE KEY-----\nSMOKE\n-----END OPENSSH PRIVATE KEY-----\n')

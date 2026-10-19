@@ -63,8 +63,10 @@ const api: Api = {
 
   pickFile: (filters) => ipcRenderer.invoke('dialog:pickFile', filters),
   importFinalshell: () => ipcRenderer.invoke('import:finalshell'),
+  importFinalshellFile: (folderId) => ipcRenderer.invoke('import:finalshellFile', folderId),
   exportConnections: (passphrase) => ipcRenderer.invoke('conn:export', passphrase),
   exportConnection: (id, passphrase) => ipcRenderer.invoke('conn:exportOne', id, passphrase),
+  exportFolder: (id, passphrase) => ipcRenderer.invoke('conn:exportFolder', id, passphrase),
   importConnections: (passphrase, path) => ipcRenderer.invoke('conn:import', passphrase, path),
 
   onSessionEvent: (cb) => {

@@ -1,6 +1,6 @@
 {
   "name": "liteshell",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Lightweight, fast, cross-platform SSH / SFTP terminal",
   "author": "lanxk",
   "license": "MIT",
@@ -43,6 +43,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.135.0",
+    "des.js": "^1.1.0",
     "openai": "^7.34.0",
     "ssh2": "^1.17.0"
   },

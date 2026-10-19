@@ -382,16 +382,17 @@ function registerIpc(): void {
     sender: WebContents,
     passphrase: string,
     defaultName: string,
-    onlyIds?: string[]
+    onlyIds?: string[],
+    folderId?: string
   ) => {
     const picked = await dialog.showSaveDialog(ownerOf(sender), {
-      title: onlyIds ? '导出这条连接' : '导出连接',
+      title: folderId ? '导出这个文件夹' : onlyIds ? '导出这条连接' : '导出连接',
       defaultPath: defaultName,
       filters: [{ name: 'LiteShell 备份', extensions: ['json'] }]
     })
     if (picked.canceled || !picked.filePath) return null
 
-    const { bundle, missing, passwords } = exportBundle(passphrase, onlyIds)
+    const { bundle, missing, passwords } = exportBundle(passphrase, onlyIds, folderId)
     // Written 0600: it carries private keys in the clear, same as FinalShell's own config.
     writeFileSync(picked.filePath, JSON.stringify(bundle, null, 2), { mode: 0o600 })
     try {
@@ -424,6 +425,12 @@ function registerIpc(): void {
     const name = conn.name.replace(/[\\/:*?"<>|]/g, '_')
     return exportToFile(e.sender, String(passphrase ?? ''), `${name}.json`, [id])
   })
+  ipcMain.handle('conn:exportFolder', (e, id: string, passphrase = '') => {
+    const folder = store().folders.find((f) => f.id === id)
+    if (!folder) return null
+    const name = folder.name.replace(/[\\/:*?"<>|]/g, '_')
+    return exportToFile(e.sender, String(passphrase ?? ''), `${name}.json`, undefined, id)
+  })
 
   // Two calls when the file is sealed: the first one answers `needsPassphrase`
   // (main cannot prompt), the second carries the passphrase and the same path.
@@ -443,21 +450,38 @@ function registerIpc(): void {
     return importBundle(bundle, keyDir(), String(passphrase ?? ''))
   })
 
+  const runFinalshellImport = (source: string, folderId: string | null) => {
+    const result = importFinalshell(source, keyDir(), folderId)
+    // Decrypted FinalShell passwords are sealed into this machine's keychain by
+    // mergeImport; an existing saved password still wins on re-import.
+    mergeImport(result.folders_new, result.connections_new, result.passwords_new)
+    // The importer unpacks keys straight into the key directory; index them so
+    // they show up in the library and can be reused by other connections.
+    for (const conn of result.connections_new) {
+      if (conn.privateKeyPath) addKey(conn.privateKeyPath, conn.name)
+    }
+    const { folders, connections, keys, passwords, needsPassword, skipped, warnings } = result
+    return { folders, connections, keys, passwords, needsPassword, skipped, warnings }
+  }
+
   ipcMain.handle('import:finalshell', async (e) => {
     const picked = await dialog.showOpenDialog(ownerOf(e.sender), {
       title: '选择 FinalShell 安装目录（包含 conn 子目录）',
       properties: ['openDirectory']
     })
     if (picked.canceled || !picked.filePaths[0]) return null
-    const result = importFinalshell(picked.filePaths[0], keyDir())
-    mergeImport(result.folders_new, result.connections_new)
-    // The importer unpacks keys straight into the key directory; index them so
-    // they show up in the library and can be reused by other connections.
-    for (const conn of result.connections_new) {
-      if (conn.privateKeyPath) addKey(conn.privateKeyPath, conn.name)
-    }
-    const { folders, connections, keys, needsPassword, skipped, warnings } = result
-    return { folders, connections, keys, needsPassword, skipped, warnings }
+    return runFinalshellImport(picked.filePaths[0], null)
+  })
+
+  // One `*_connect_config.json`, as produced by FinalShell's per-connection export.
+  ipcMain.handle('import:finalshellFile', async (e, folderId: string | null = null) => {
+    const picked = await dialog.showOpenDialog(ownerOf(e.sender), {
+      title: '选择 FinalShell 连接配置',
+      properties: ['openFile'],
+      filters: [{ name: 'FinalShell 连接配置', extensions: ['json'] }]
+    })
+    if (picked.canceled || !picked.filePaths[0]) return null
+    return runFinalshellImport(picked.filePaths[0], folderId || null)
   })
 
   ipcMain.handle('dialog:pickFile', async (e, filters?: { name: string; extensions: string[] }[]) => {

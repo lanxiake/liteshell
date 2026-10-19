@@ -296,6 +296,8 @@ export interface ImportSummary {
   folders: number
   connections: number
   keys: number
+  /** Passwords decrypted from FinalShell's ciphertext and stored in the keychain. */
+  passwords: number
   /** Connections whose stored password could not be recovered. */
   needsPassword: number
   /** Connections skipped because their transport is not SSH. */
@@ -406,12 +408,16 @@ export interface Api {
 
   /** Imports a FinalShell install directory; resolves null if the user cancels. */
   importFinalshell(): Promise<ImportSummary | null>
+  /** One `*_connect_config.json`; `folderId` files it below that folder. */
+  importFinalshellFile(folderId?: string | null): Promise<ImportSummary | null>
   /** `passphrase` seals the passwords and the API key into the file; empty
    *  leaves them behind, as before. */
   exportConnections(passphrase?: string): Promise<ExportReport | null>
   /** A bundle for one connection only — its password travels under the same
    *  passphrase rule as the full export. */
   exportConnection(id: string, passphrase?: string): Promise<ExportReport | null>
+  /** A bundle for one folder and everything below it. */
+  exportFolder(id: string, passphrase?: string): Promise<ExportReport | null>
   /** `path` is only for the second call, after a `needsPassphrase` answer. */
   importConnections(
     passphrase?: string,

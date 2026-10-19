@@ -37,6 +37,11 @@ function connection(dir, cfg) {
 folder(sub, 'folderA', '生产环境', 'root')
 folder(nested, 'folderB', '嵌套层', 'folderA')
 
+/* Encrypted by FinalShell's scheme (DES + java.util.Random key derivation);
+   plaintext is `final-test-密码`. Generated with the same algorithm and frozen
+   here so a regression in the key derivation is caught, not re-derived. */
+const ENC_PASSWORD = 'BQkCBwQGCANFhMCQqNy69sRNw9vHQy5kapg2hE+0WXqSvcnzZnLcag=='
+
 connection(conn, {
   id: 'c1',
   name: 'root上的机器',
@@ -44,6 +49,7 @@ connection(conn, {
   port: 22,
   user_name: 'root',
   authentication_type: 1,
+  password: ENC_PASSWORD,
   parent_id: 'root',
   conection_type: 100
 })
@@ -108,7 +114,10 @@ const foldersById = Object.fromEntries(result.folders_new.map((f) => [f.id, f]))
 check('导入 2 个文件夹', result.folders === 2, `got ${result.folders}`)
 check('导入 3 条 SSH 连接', result.connections === 3, `got ${result.connections}`)
 check('跳过 1 条非 SSH 连接', result.skipped === 1, `got ${result.skipped}`)
-check('统计出 1 条需要补录密码', result.needsPassword === 1, `got ${result.needsPassword}`)
+check('密码解密成功，不再需要补录', result.passwords === 1 && result.needsPassword === 0,
+  JSON.stringify({ passwords: result.passwords, needsPassword: result.needsPassword }))
+check('解出来的密码与 FinalShell 原文一致', result.passwords_new['fs-c1'] === 'final-test-密码',
+  JSON.stringify(result.passwords_new))
 
 check('根级连接的 folderId 为 null', byId['fs-c1'].folderId === null)
 check('一级文件夹挂到根', foldersById['fs-folderA'].parentId === null)
@@ -173,6 +182,34 @@ check('导出树：连接照常导入', exp.connections === 2, `got ${exp.connec
 
 check('安装目录：folder.json 的名字优先于目录名', foldersById['fs-folderA']?.name === '生产环境')
 check('安装目录：parent_id 命中时不走路径推断', byId['fs-c3']?.folderId === 'fs-folderB')
+
+/* ---------------- one exported `*_connect_config.json` ---------------- */
+
+const singleFile = join(work, '10.157.150.22-GPU_connect_config.json')
+writeFileSync(
+  singleFile,
+  JSON.stringify({
+    id: 'solo',
+    name: '单条导出',
+    host: '10.157.150.22',
+    port: 22,
+    user_name: 'test001',
+    authentication_type: 1,
+    password: ENC_PASSWORD,
+    conection_type: 100
+  })
+)
+
+const solo = importFinalshell(singleFile, join(work, 'keys3'))
+const soloConn = solo.connections_new[0]
+check('单个连接文件也能导入', solo.connections === 1 && soloConn?.id === 'fs-solo')
+check('单文件导入带出主机与用户名',
+  soloConn?.host === '10.157.150.22' && soloConn?.username === 'test001')
+check('单文件导入自动解密密码', solo.passwords_new['fs-solo'] === 'final-test-密码')
+check('单文件导入默认落在根', soloConn?.folderId === null)
+
+const soloInFolder = importFinalshell(singleFile, join(work, 'keys4'), 'target-folder')
+check('指定目录时连接挂到该目录下', soloInFolder.connections_new[0]?.folderId === 'target-folder')
 
 rmSync(work, { recursive: true, force: true })
 console.log(failures === 0 ? '\nIMPORT TEST PASS' : `\nIMPORT TEST FAIL (${failures})`)

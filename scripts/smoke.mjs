@@ -1441,6 +1441,23 @@ async function main() {
   await evaluate(cdp, `document.querySelector('#overlay .modal footer .btn.primary').click()`)
   await waitFor(cdp, `document.querySelector('#overlay').hidden`, '私钥面板关闭')
 
+  /* ---------------- folder context menu ---------------- */
+
+  const folderMenu = await evaluate(
+    cdp,
+    `(() => {
+       const node = document.querySelector('.node[data-kind="folder"]')
+       node.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 180, clientY: 180 }))
+       return [...document.querySelectorAll('#menu > div')].map(d => d.textContent).join('|')
+     })()`
+  )
+  check(
+    '目录右键有导入与导出',
+    /导入 FinalShell 连接文件/.test(folderMenu) && /导出此文件夹/.test(folderMenu),
+    folderMenu
+  )
+  await evaluate(cdp, `document.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))`)
+
   /* ---------------- pick a key in the connection editor ---------------- */
 
   // Identified by an option carrying the library path: the modal has several selects.
