@@ -1,4 +1,4 @@
-import type { CpuCore, GpuInfo, MonitorSnapshot, NetIface } from '../shared/types'
+import type { CpuCore, GpuInfo, MonitorSnapshot, NetCounter, NetIface } from '../shared/types'
 
 /**
  * Resource sampling for Linux hosts, in the spirit of what FinalShell scrapes:
@@ -49,6 +49,7 @@ const EMPTY = {
   netDown: 0,
   netUp: 0,
   net: [],
+  netTotals: [],
   disk: [],
   gpu: [],
   uptime: 0,
@@ -114,6 +115,7 @@ export function parseMonitor(raw: string, at = Date.now()): MonitorSnapshot {
     info: { ...EMPTY.info },
     load: [0, 0, 0],
     net: [],
+    netTotals: [],
     disk: [],
     gpu: [],
     at
@@ -144,6 +146,16 @@ export function parseMonitor(raw: string, at = Date.now()): MonitorSnapshot {
     if (name === 'lo') continue // loopback would double-count local traffic
     snapshot.netDown += rx
     snapshot.netUp += tx
+  }
+  // Same sample, read as a counter rather than a delta: traffic since boot is
+  // what people mean by "how much has this box moved", and a reboot resets it.
+  if (netB.size) {
+    const totals: NetCounter[] = []
+    for (const [name, b] of netB) {
+      if (name === 'lo') continue
+      totals.push({ name, rxBytes: b.rx, txBytes: b.tx })
+    }
+    snapshot.netTotals = totals.sort((x, y) => y.rxBytes + y.txBytes - (x.rxBytes + x.txBytes))
   }
 
   /* --- memory --- */

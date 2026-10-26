@@ -84,6 +84,9 @@ check(
   JSON.stringify(m.net)
 )
 check('表头行没有被当成网卡', m.net.length === 2, `got ${m.net.map((n) => n.name).join(',')}`)
+check('累计流量取第二次采样，不是两次之差', m.netTotals.find((n) => n.name === 'eth0')?.rxBytes === 512000,
+  JSON.stringify(m.netTotals))
+check('累计流量不含回环', !m.netTotals.some((n) => n.name === 'lo'), JSON.stringify(m.netTotals))
 
 /* ---------------- memory ---------------- */
 check('内存总量', m.memTotal === 16384000 * 1024, `got ${m.memTotal}`)
@@ -128,6 +131,7 @@ kernel=Linux 3.10.0
 check('没有 nvidia-smi 时 GPU 列表为空', bare.gpu.length === 0)
 check('没有 MemAvailable 时退回 MemFree', bare.memUsed === (1000000 - 200000) * 1024, `got ${bare.memUsed}`)
 check('没有 /proc/net/dev 时速率为 0', bare.netDown === 0 && bare.netUp === 0)
+check('没有网卡时累计流量为空列表而不是 undefined', Array.isArray(bare.netTotals) && bare.netTotals.length === 0)
 check('没有 nproc 时核心数为 0 而不是 NaN', bare.cpuCores === 0)
 check('完全没有输出也不抛异常', parseMonitor('').cpu === 0)
 

@@ -1,6 +1,6 @@
 {
   "name": "liteshell",
-  "version": "0.2.1",
+  "version": "0.2.5",
   "description": "Lightweight, fast, cross-platform SSH / SFTP terminal",
   "author": "lanxk",
   "license": "MIT",
@@ -40,7 +40,8 @@
     "test:monitor": "node scripts/test-monitor.mjs",
     "test:textfile": "node scripts/test-textfile.mjs",
     "test:commands": "node scripts/test-commands.mjs",
-    "test:alerts": "node scripts/test-alerts.mjs"
+    "test:alerts": "node scripts/test-alerts.mjs",
+    "sha256": "node scripts/make-sha256.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.135.0",

@@ -27,6 +27,8 @@ const api: Api = {
   attachSession: (id) => ipcRenderer.invoke('session:attach', id),
   releaseSession: (id) => ipcRenderer.invoke('session:release', id),
   popOutSession: (id, connectionId) => ipcRenderer.invoke('session:popOut', id, connectionId),
+  popOutAgent: (sessionId, connectionId) => ipcRenderer.invoke('agent:popOut', sessionId, connectionId),
+  attachAgentWindow: (sessionId) => ipcRenderer.invoke('agent:attachWindow', sessionId),
 
   sftpList: (id, path) => ipcRenderer.invoke('sftp:list', id, path),
   sftpHome: (id) => ipcRenderer.invoke('sftp:home', id),
@@ -55,6 +57,10 @@ const api: Api = {
   agentAbort: (sessionId) => ipcRenderer.invoke('agent:abort', sessionId),
   listModels: (cfg) => ipcRenderer.invoke('llm:models', cfg),
   agentReset: (sessionId) => ipcRenderer.invoke('agent:reset', sessionId),
+  agentHistory: (connectionId) => ipcRenderer.invoke('agent:history', connectionId),
+  agentHistoryGet: (id) => ipcRenderer.invoke('agent:historyGet', id),
+  agentHistoryDelete: (id) => ipcRenderer.invoke('agent:historyDelete', id),
+  agentHistoryExport: (id) => ipcRenderer.invoke('agent:historyExport', id),
 
   setWindowChrome: (bg, fg) => ipcRenderer.invoke('window:chrome', bg, fg),
 
@@ -65,10 +71,30 @@ const api: Api = {
   importFinalshell: () => ipcRenderer.invoke('import:finalshell'),
   importFinalshellFile: (folderId) => ipcRenderer.invoke('import:finalshellFile', folderId),
   setupPasswordless: (id, secret) => ipcRenderer.invoke('conn:passwordless', id, secret),
+  netInterfaces: () => ipcRenderer.invoke('net:interfaces'),
   exportConnections: (passphrase) => ipcRenderer.invoke('conn:export', passphrase),
   exportConnection: (id, passphrase) => ipcRenderer.invoke('conn:exportOne', id, passphrase),
   exportFolder: (id, passphrase) => ipcRenderer.invoke('conn:exportFolder', id, passphrase),
   importConnections: (passphrase, path) => ipcRenderer.invoke('conn:import', passphrase, path),
+
+  onAgentCleared: (cb) => {
+    const handler = (_e: unknown, id: string): void => cb(id)
+    ipcRenderer.on('agent:cleared', handler)
+    return () => ipcRenderer.removeListener('agent:cleared', handler)
+  },
+
+  closeWindow: () => ipcRenderer.invoke('window:close'),
+
+  updateCheck: () => ipcRenderer.invoke('update:check'),
+  updateDownload: () => ipcRenderer.invoke('update:download'),
+  updateInstall: (path) => ipcRenderer.invoke('update:install', path),
+  updateReleasesUrl: () => ipcRenderer.invoke('update:releasesUrl'),
+  appVersion: () => ipcRenderer.invoke('app:version'),
+  onUpdateProgress: (cb) => {
+    const handler = (_e: unknown, received: number, total: number): void => cb(received, total)
+    ipcRenderer.on('update:progress', handler)
+    return () => ipcRenderer.removeListener('update:progress', handler)
+  },
 
   onSessionEvent: (cb) => {
     const handler = (_e: unknown, ev: SessionEvent): void => cb(ev)

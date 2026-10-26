@@ -31,10 +31,10 @@ await build({
   outfile: bundle,
   logLevel: 'silent'
 })
-const { gate, riskOf, readOnly } = await import(`file://${bundle.replaceAll('\\', '/')}`)
+const { gate, riskOf } = await import(`file://${bundle.replaceAll('\\', '/')}`)
 
 /** Only there to make a failure readable: which half of the verdict was wrong. */
-const readOnlyOf = (c) => `readOnly=${readOnly(c)} risk=${riskOf(c)}`
+const whyOf = (c) => `risk=${riskOf(c)}`
 
 /* ---------- reads never prompt ---------- */
 
@@ -42,59 +42,62 @@ for (const tool of ['ls', 'cat', 'monitor', 'read_output']) {
   check(`${tool} 直接执行`, gate(tool).auto)
 }
 
-/* ---------- every write prompts, regardless of how harmless it looks ---------- */
+/* ---------- what waits for a person: only what cannot be undone ---------- */
 
-for (const tool of ['exec', 'rm', 'mkdir', 'mv', 'put', 'get']) {
-  check(`${tool} 需要确认`, !gate(tool).auto)
+const ASK = [
+  'rm file.txt',
+  'rm -rf ./build',
+  'mv /var/log/app.log /tmp/',
+  'tail -n 5 app.log > out.txt',
+  'tee /tmp/out.txt',
+  'docker compose down',
+  'kubectl delete pod web-0',
+  'git reset --hard HEAD~3',
+  'apt-get remove nginx',
+  'crontab -r',
+  'userdel -r alice', // also critical
+  'echo hello > /tmp/out.txt'
+]
+for (const c of ASK) {
+  check(`会丢数据，要问: ${c}`, !gate('exec', c).auto, whyOf(c))
 }
 
-check('空命令不会被当成安全而放行 exec', !gate('exec', '').auto)
-
-/* ---------- reads in the shell run too — that is what the list is for ---------- */
+/* ---------- and everything recoverable just runs ---------- */
 
 const AUTO = [
   'tail -n 200 /var/log/nginx/error.log',
   'grep -c "ERROR" /var/log/app.log',
   'journalctl -u nginx -n 200 --no-pager',
   'systemctl status nginx',
-  'systemctl list-units --failed',
   'docker ps -a',
-  'kubectl get pods -n prod',
   'git log --oneline -20',
   'df -h',
-  'du -sh /var/log',
   'ls -la /etc/nginx',
   'find /var/log -name "*.gz" -mtime +7',
-  'cat /proc/meminfo',
-  'ss -lntp',
-  'crontab -l',
-  'ip addr'
-]
-for (const c of AUTO) {
-  check(`不用问: ${c}`, gate('exec', c).auto, readOnlyOf(c))
-}
-
-/* ---------- and everything else still asks, however harmless it reads ---------- */
-
-const ASK = [
-  'systemctl start nginx', // the reason this is a whitelist and not a blacklist
-  "python -c 'import os; os.system(\"id\")'",
-  'find . -delete',
-  'journalctl --vacuum-time=7d',
-  'sed -i s/a/b/ app.conf',
-  'ls -la | grep nginx', // a second process on the line
-  'tail -n 5 app.log > out.txt',
-  'echo $(whoami)',
-  'ls `pwd`',
-  'df -h && free -m',
-  'nginx -t && systemctl status nginx',
+  'ip addr',
+  // Restarting, installing and chmod-ing are all recoverable; prompting here
+  // is what wears the prompt out.
+  'systemctl restart nginx',
+  'systemctl reload nginx',
   'npm install',
-  'ip addr add 10.0.0.5/24 dev eth0', // the same verb, one word further on
+  'apt-get install -y nginx',
+  'chmod 600 key.pem',
+  'git push origin main',
+  'kubectl apply -f deploy.yaml',
+  'ls -la | grep nginx',
+  'df -h && free -m',
+  'echo $(whoami)',
+  'ip addr add 10.0.0.5/24 dev eth0',
+  'sudo systemctl restart sshd',
   'something-nobody-anticipated --yes'
 ]
-for (const c of ASK) {
-  check(`还是要问: ${c}`, !gate('exec', c).auto, readOnlyOf(c))
+for (const c of AUTO) {
+  check(`不用问: ${c}`, gate('exec', c).auto, whyOf(c))
 }
+
+check('空命令不会被当成安全而放行 exec', !gate('exec', '').auto)
+check('mkdir/mv/rm 这些工具本身按命令判，不是一律弹卡', gate('mkdir', 'mkdir -p /tmp/x').auto)
+check('删除工具照旧要问', !gate('rm', 'rm /tmp/x').auto)
 
 /* ---------- critical: no undo ---------- */
 

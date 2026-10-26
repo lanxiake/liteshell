@@ -12,20 +12,27 @@ import {
   type WebContents
 } from 'electron'
 import type {
+  AgentEvent,
   BackupBundle,
   Connection,
   Folder,
   KeyFile,
   QuickCommand,
   SessionEvent,
-  Settings
+  Settings,
+  UpdateAsset
 } from '../shared/types'
 import { SshManager } from './ssh'
 import { CliServer } from './cli-server'
 import { AgentRunner, clearSpill } from './agent'
+import * as history from './agenthistory'
+import { transcriptMarkdown } from './transcript'
 import { listModels } from './agent-providers'
 import { importFinalshell } from './finalshell'
 import { setupPasswordless } from './passwordless'
+import { localInterfaces } from './localnet'
+import { checkForUpdate, downloadUpdate, installUpdate, RELEASES_URL } from './update'
+import { sshAlias } from './sshconfig'
 import {
   addKey,
   duplicateConnection,
@@ -63,6 +70,14 @@ const pending = new Map<string, SessionEvent[]>()
 const windowSessions = new Map<number, Set<string>>()
 /** Popped-out windows that have not attached yet, by webContents id. */
 const popped = new Map<number, string>()
+/** The conversation, as events, for every session with one. A popped-out AI
+ *  window is a second view of it and has to start filled in; the terminal
+ *  windows keep their own DOM and do not need this. Deltas are not kept — every
+ *  answer is also emitted once, whole, as an `assistant` event. */
+const agentLog = new Map<string, AgentEvent[]>()
+/** AI windows watching a conversation. Unlike terminals, this is a mirror: the
+ *  panel in the main window keeps receiving events too. */
+const agentWindows = new Map<string, Set<WebContents>>()
 let tray: Tray | null = null
 let manager: SshManager
 let cli: CliServer | null = null
@@ -76,6 +91,21 @@ function emit(ev: SessionEvent): void {
   // no longer connected, and its output handles point at nothing re-readable.
   if (ev.type === 'status' && (ev.status === 'closed' || ev.status === 'error')) {
     agent?.forget(ev.sessionId)
+    agentLog.delete(ev.sessionId)
+  }
+
+  if (ev.type === 'agent') {
+    if (ev.event.kind !== 'delta') {
+      const log = agentLog.get(ev.sessionId) ?? []
+      log.push(ev.event)
+      // ponytail: 500 keeps the replay small; a longer conversation is already
+      // capped by the agent itself, so this only trims pathological runs.
+      if (log.length > 500) log.shift()
+      agentLog.set(ev.sessionId, log)
+    }
+    for (const wc of agentWindows.get(ev.sessionId) ?? []) {
+      if (!wc.isDestroyed()) wc.send('session:event', ev)
+    }
   }
 
   const sid = 'sessionId' in ev ? ev.sessionId : ''
@@ -96,6 +126,10 @@ function emit(ev: SessionEvent): void {
 
 /** A window is gone: hang up the sessions only it was showing. */
 function forgetWindow(wcId: number): void {
+  for (const [sid, set] of agentWindows) {
+    for (const wc of set) if (wc.id === wcId) set.delete(wc)
+    if (!set.size) agentWindows.delete(sid)
+  }
   const ids = windowSessions.get(wcId)
   windowSessions.delete(wcId)
   for (const sid of ids ?? []) {
@@ -297,6 +331,25 @@ function registerIpc(): void {
     popped.set(child.webContents.id, sessionId)
     return true
   })
+  ipcMain.handle('agent:popOut', (_e, sessionId: string, connectionId: string) => {
+    const conn = store().connections.find((c) => c.id === connectionId)
+    const child = createWindow({ agent: sessionId, conn: connectionId }, true)
+    child.setTitle(`${conn?.name ?? 'LiteShell'} · AI`)
+    return true
+  })
+  ipcMain.handle('agent:attachWindow', (e, sessionId: string) => {
+    let set = agentWindows.get(sessionId)
+    if (!set) {
+      set = new Set()
+      agentWindows.set(sessionId, set)
+    }
+    set.add(e.sender)
+    // A parked approval is always the last event: anything after it means it
+    // was answered, and a replayed card would be a button that does nothing.
+    return (agentLog.get(sessionId) ?? []).filter(
+      (ev, i, all) => ev.kind !== 'ask' || i === all.length - 1
+    )
+  })
 
   ipcMain.handle('sftp:home', (_e, id: string) => manager.home(id))
   ipcMain.handle('sftp:list', (_e, id: string, path: string) => manager.list(id, path))
@@ -350,6 +403,28 @@ function registerIpc(): void {
 
   // The OS-drawn window buttons sit in the title bar strip, so they need the theme
   // background too — CSS can't reach them.
+  ipcMain.handle('window:close', (e) => BrowserWindow.fromWebContents(e.sender)?.close())
+  // The check keeps the asset it found: the download button is pressed in a
+  // later dialog, and re-checking there would make a release pulled in between
+  // the two clicks silently download something other than what was shown.
+  let pendingUpdate: UpdateAsset | null = null
+  ipcMain.handle('update:check', async () => {
+    const result = await checkForUpdate()
+    pendingUpdate = result.kind === 'available' ? result.asset : null
+    return result
+  })
+  ipcMain.handle('update:download', async (e) => {
+    if (!pendingUpdate) throw new Error('没有可下载的更新，先点「检查更新」')
+    const sender = e.sender
+    return downloadUpdate(pendingUpdate, (received, total) => {
+      if (!sender.isDestroyed()) sender.send('update:progress', received, total)
+    })
+  })
+  ipcMain.handle('update:install', (_e, path: string) => installUpdate(path))
+  ipcMain.handle('update:releasesUrl', () => {
+    void shell.openExternal(RELEASES_URL)
+  })
+  ipcMain.handle('app:version', () => app.getVersion())
   ipcMain.handle('window:chrome', (e, bg: string, fg: string) => {
     if (process.platform === 'darwin') return
     BrowserWindow.fromWebContents(e.sender)?.setTitleBarOverlay({ color: bg, symbolColor: fg, height: 40 })
@@ -376,7 +451,34 @@ function registerIpc(): void {
     (_e, cfg: { provider: Settings['llm']['provider']; baseUrl: string; apiKey?: string }) =>
       listModels({ ...cfg, apiKey: cfg.apiKey || llmSettings().apiKey })
   )
-  ipcMain.handle('agent:reset', (_e, sessionId: string) => agent?.reset(sessionId))
+  ipcMain.handle('agent:reset', (_e, sessionId: string) => {
+    agentLog.delete(sessionId)
+    agent?.reset(sessionId)
+    // The transcript is one thing with several views; clearing it in the
+    // window it was clicked in only would leave the other one lying.
+    for (const w of BrowserWindow.getAllWindows()) w.webContents.send('agent:cleared', sessionId)
+  })
+  ipcMain.handle('agent:history', (_e, connectionId: string) => history.list(connectionId))
+  ipcMain.handle('agent:historyGet', (_e, id: string) => history.get(id))
+  ipcMain.handle('agent:historyDelete', (_e, id: string) => history.remove(id))
+  ipcMain.handle('agent:historyExport', async (e, id: string) => {
+    const convo = history.get(id)
+    if (!convo) return null
+    const picked = await dialog.showSaveDialog(ownerOf(e.sender), {
+      title: '导出 AI 对话',
+      defaultPath: `${convo.title.replace(/[\\/:*?"<>|]/g, '_').slice(0, 40)}.md`,
+      filters: [
+        { name: 'Markdown', extensions: ['md'] },
+        { name: 'JSON', extensions: ['json'] }
+      ]
+    })
+    if (picked.canceled || !picked.filePath) return null
+    const text = picked.filePath.toLowerCase().endsWith('.json')
+      ? JSON.stringify(convo, null, 2)
+      : transcriptMarkdown(convo, store().connections.find((c) => c.id === convo.connectionId)?.name)
+    writeFileSync(picked.filePath, text, 'utf8')
+    return picked.filePath
+  })
 
   /** One save dialog + one file, shared by "export everything" and "export this one". */
   const exportToFile = async (
@@ -414,11 +516,24 @@ function registerIpc(): void {
   // One-click `ssh <host>`: the stored secret (or the one just typed) authorises
   // installing the local public key, and the ssh config block is written after
   // a key-only login is proven.
-  ipcMain.handle('conn:passwordless', (_e, id: string, secret?: string) => {
+  ipcMain.handle('conn:passwordless', async (_e, id: string, secret?: string) => {
     const conn = store().connections.find((c) => c.id === id)
     if (!conn) throw new Error(`未知连接: ${id}`)
-    return setupPasswordless(conn, secret)
+    // The alias is the address unless another profile already claimed it, in
+    // which case this one gets the next letter. Assigned once and then stored
+    // so configuring twice does not walk it a letter down; re-derived when the
+    // address itself changed, because the name is supposed to be the address.
+    let alias = conn.sshAlias
+    if (!alias || !alias.startsWith(conn.host)) {
+      const taken = store()
+        .connections.filter((c) => c.id !== id && c.sshAlias)
+        .map((c) => c.sshAlias as string)
+      alias = sshAlias(conn.host, taken)
+      upsertConnection({ ...conn, sshAlias: alias }, null)
+    }
+    return setupPasswordless(conn, secret, alias)
   })
+  ipcMain.handle('net:interfaces', () => localInterfaces())
 
   ipcMain.handle('conn:export', (e, passphrase = '') =>
     exportToFile(
@@ -539,6 +654,9 @@ app.on('window-all-closed', () => undefined)
 
 app.on('before-quit', () => {
   quitting = true
+  // The history write is debounced; quitting inside the window would lose the
+  // last turn of the conversation the user just closed.
+  history.flush()
   cli?.close()
   manager?.disconnectAll()
 })

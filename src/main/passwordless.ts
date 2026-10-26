@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { Client, utils } from 'ssh2'
 import type { Connection, PasswordlessResult } from '../shared/types'
 import { hostKey, keySecretOf, rememberHostKey, secretOf } from './store'
+import { bindAddress } from './localnet'
 import { installCommand, sshConfigWith } from './sshconfig'
 
 /** Where the generated key lives. `ssh` also reads it through IdentityFile in
@@ -45,9 +46,9 @@ function verifier(conn: Connection): (key: Buffer) => boolean {
   return (key: Buffer): boolean => {
     const fingerprint =
       'SHA256:' + createHash('sha256').update(key).digest('base64').replace(/=+$/, '')
-    const known = hostKey(conn.host, conn.port)
+    const known = hostKey(conn.id)
     if (!known) {
-      rememberHostKey(conn.host, conn.port, fingerprint)
+      rememberHostKey(conn, fingerprint)
       return true
     }
     return known === fingerprint
@@ -62,6 +63,7 @@ function connect(conn: Connection, secret?: string, identity?: Buffer): Promise<
     port: conn.port,
     username: conn.username,
     readyTimeout: 20_000,
+    ...(bindAddress(conn) ? { localAddress: bindAddress(conn) } : {}),
     hostVerifier: verifier(conn)
   }
 
@@ -143,12 +145,15 @@ function exec(
   })
 }
 
-function updateSshConfig(conn: Connection): string {
+function updateSshConfig(conn: Connection, alias: string): string {
   const dir = join(homedir(), '.ssh')
   const file = join(dir, 'config')
   mkdirSync(dir, { recursive: true })
   const old = existsSync(file) ? readFileSync(file, 'utf8') : ''
-  writeFileSync(file, sshConfigWith(old, conn), { mode: 0o600 })
+  // Only a pinned address goes into the file. An interface's address would be
+  // frozen at today's lease, and plain `ssh` has no port of ours to resolve it
+  // again — a stale BindAddress there fails every login after a reconnect.
+  writeFileSync(file, sshConfigWith(old, { ...conn, alias }), { mode: 0o600 })
   try {
     chmodSync(file, 0o600)
   } catch {
@@ -164,7 +169,8 @@ function updateSshConfig(conn: Connection): string {
  */
 export async function setupPasswordless(
   conn: Connection,
-  secret?: string
+  secret?: string,
+  alias = conn.host
 ): Promise<PasswordlessResult> {
   const key = ensureKey()
 
@@ -196,8 +202,9 @@ export async function setupPasswordless(
     check.end()
   }
 
-  const configPath = updateSshConfig(conn)
+  const configPath = updateSshConfig(conn, alias)
   return {
+    alias,
     host: conn.host,
     port: conn.port,
     username: conn.username,

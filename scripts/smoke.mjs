@@ -331,8 +331,10 @@ function framesFor(messages) {
 
   if (last.role === 'user') {
     if (text.includes('附件')) return toolFrames('cat', { path: '/tmp/attach-smoke.txt' })
-    if (text.includes('停下来')) return toolFrames('exec', { command: 'sleep 999' })
-    if (text.includes('长输出')) return toolFrames('exec', { command: 'SMOKE_BIG' })
+    if (text.includes('停下来')) return toolFrames('exec', { command: 'rm -rf /tmp/slow' })
+    // Destructive on purpose: under the current gate only the commands that
+    // lose data stop to ask, and this test is about what happens at that card.
+    if (text.includes('长输出')) return toolFrames('exec', { command: 'rm -rf /tmp/old && SMOKE_BIG' })
     if (text.includes('清空')) return toolFrames('exec', { command: 'rm -rf /' })
     if (text.includes('根目录')) return toolFrames('ls', { path: '/' })
     if (text.includes('慢慢地')) return sayFrames('来了，慢是因为它在想。')
@@ -546,7 +548,6 @@ function seedProfile() {
           cursorBlink: true,
           scrollback: 500,
           copyOnSelect: true,
-          rightClickPaste: true,
           // The model is the fake endpoint above; the key is typed into the
           // settings dialog during the run, since a seeded one would be
           // ciphertext this machine cannot read.
@@ -725,8 +726,50 @@ async function main() {
   )
   check('文件夹已展开显示子节点', (await evaluate(cdp, `document.querySelectorAll('.node').length`)) >= 2)
 
-  // The real user path: click the connection.
+  /* ---------------- sidebar: collapse, right-click, drag ---------------- */
+
+  await evaluate(cdp, `document.querySelector('#btn-side').click()`)
+  check('标题栏能收起连接列表', await evaluate(cdp, `document.body.classList.contains('side-off') && !document.querySelector('#sidebar').offsetParent`))
+  await evaluate(cdp, `document.querySelector('#btn-side').click()`)
+  check('再点一次展开', await evaluate(cdp, `!document.body.classList.contains('side-off') && !!document.querySelector('#sidebar').offsetParent`))
+
+  await evaluate(cdp, `(() => {
+    const tree = document.querySelector('#tree')
+    tree.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 40, clientY: 400 }))
+  })()`)
+  check('列表空白处右键能新建',
+    await evaluate(cdp, `(() => {
+      const labels = [...document.querySelectorAll('#menu div')].map(d => d.textContent)
+      return labels.includes('新建连接') && labels.includes('新建文件夹')
+    })()`))
+  await evaluate(cdp, `document.querySelector('#menu').remove()`)
+
+  // Drag a connection out of its folder onto the root, the same way the
+  // pointer does it: dragstart on the node, then drop on the tree's blank area.
+  await evaluate(cdp, `(() => {
+    const src = [...document.querySelectorAll('.node')].find(n => n.querySelector('.label')?.textContent === 'local-loose')
+    const dt = new DataTransfer()
+    src.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer: dt }))
+    const tree = document.querySelector('#tree')
+    tree.dispatchEvent(new DragEvent('drop', { bubbles: true, dataTransfer: dt, clientX: 40, clientY: 500 }))
+    src.dispatchEvent(new DragEvent('dragend', { bubbles: true, dataTransfer: dt }))
+  })()`)
+  check(
+    '把连接拖到空白处就是移到根目录',
+    await waitFor(
+      cdp,
+      `window.api.getStore().then(s => s.connections.find(c => c.id === 'loose')?.folderId == null)`,
+      '拖到根目录',
+      8000
+    )
+  )
+
+  // Clicking now only selects; opening is the double click.
   await evaluate(cdp, `document.querySelectorAll('.node')[1].click()`)
+  check('单击只是选中，不会自己连上去',
+    await evaluate(cdp, `document.querySelectorAll('.node')[1].classList.contains('sel') && document.querySelectorAll('#tabs .tab').length === 0`),
+    await evaluate(cdp, `document.querySelectorAll('#tabs .tab').length`))
+  await evaluate(cdp, `document.querySelectorAll('.node')[1].dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))`)
 
   const gotBanner = await waitFor(
     cdp,
@@ -1073,12 +1116,18 @@ async function main() {
          const gauges = [...document.querySelectorAll('.gauge')]
          const val = (i) => gauges[i].querySelector('.gauge-value').textContent
          const detail = (i) => gauges[i].querySelector('.gauge-detail').textContent
-         const section = (i) => document.querySelectorAll('.mon-section')[i].textContent
+         // By title: the sections are added to over time, and an index silently
+         // starts pointing at a different reading when one is.
+         const section = (title) =>
+           [...document.querySelectorAll('.mon-section')]
+             .find(s => s.querySelector('.mon-title')?.textContent === title)?.textContent ?? ''
          return JSON.stringify({
            labels: gauges.map(g => g.querySelector('.gauge-label').textContent),
            cpu: val(0), mem: val(1), memDetail: detail(1), swap: val(2),
            netDown: val(3), netUp: detail(3),
-           gpu: section(0), disk: section(1),
+           netMeta: gauges[3].querySelector('.mon-line').textContent,
+           netRows: [...document.querySelectorAll('.mon-net')].map(r => r.textContent).join('|'),
+           gpu: section('GPU'), disk: section('磁盘'),
            diskTitles: [...document.querySelectorAll('.mon-disk')].map(r => r.title).join('|'),
            info: document.querySelector('.mon-info').textContent,
            sparks: document.querySelectorAll('.spark').length,
@@ -1118,6 +1167,9 @@ async function main() {
   check('内存按 MemAvailable 算并给出用量', mon.mem === '76%' && mon.memDetail === '12 GB / 16 GB', `${mon.mem} ${mon.memDetail}`)
   check('Swap 用掉一半', mon.swap === '50%', mon.swap)
   check('网速取两次采样的差值', mon.netDown === '↓ 12 KB/s' && mon.netUp === '↑ 4.7 KB/s', `${mon.netDown} ${mon.netUp}`)
+  // eth0's counters from the canned capture: 512000 / 204800 bytes.
+  check('每个网卡一行，速率和累计都分开', /eth0/.test(mon.netRows) && /↓500 KB/.test(mon.netRows) && /↑200 KB/.test(mon.netRows), mon.netRows)
+  check('延迟和累计流量写在仪表下面', /延迟/.test(mon.netMeta) && /累计/.test(mon.netMeta), mon.netMeta)
   check('GPU 卡片显示编号/型号/温度/显存', /#0/.test(mon.gpu) && /Tesla T4/.test(mon.gpu) && /45°C/.test(mon.gpu) && /1\.0 GB \/ 15 GB/.test(mon.gpu), mon.gpu)
   // Reported bug: an unlabelled bar sat above the vram line, so the two looked
   // like they described each other. One labelled row, one number, one bar.
@@ -1601,7 +1653,10 @@ async function main() {
   // Click the password connection, which has no stored secret. It must ask first.
   await evaluate(
     cdp,
-    `[...document.querySelectorAll('.node')].find(n => n.querySelector('.label')?.textContent === 'local-pw').click()`
+    `(() => {
+       const n = [...document.querySelectorAll('.node')].find(n => n.querySelector('.label')?.textContent === 'local-pw')
+       n.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+     })()`
   )
   if (
     await waitFor(
@@ -1890,7 +1945,7 @@ async function main() {
       llmSeen.at(-1).messages.some((m) => m.role === 'tool' && String(m.content).startsWith('用户拒绝')))
 
   await sendMsg('跑一下 echo 试试')
-  // `echo` only prints, so it is on the whitelist and goes straight through.
+  // `echo` only prints, so it is not destructive and goes straight through.
   // The whole point of this route: the command the model asked for is typed
   // into the terminal the user is looking at, not run out of sight.
   check('只读的 exec 不问就直接跑了：输出和退出码都在结果里',
@@ -2026,6 +2081,74 @@ async function main() {
     await waitFor(cdp, `${LOG}.includes('接口回了空内容')`, '空回复提示', 30000),
     await evaluate(cdp, LOG))
 
+  /* ---------------- ai panel in its own window ---------------- */
+
+  await evaluate(cdp, `document.querySelector('.pane.active [title="在独立窗口中打开 AI 面板"]').click()`)
+  await sleep(1500)
+  const pages = async () => (await (await fetch(`http://127.0.0.1:${DEBUG_PORT}/json/list`)).json())
+  const aiTarget = (await pages()).find((t) => t.type === 'page' && t.url.includes('agent='))
+  check('AI 面板能弹成独立窗口', !!aiTarget)
+  if (aiTarget) {
+    const cdpAi = await connect(aiTarget.webSocketDebuggerUrl)
+    check(
+      '独立窗口里只有 AI 面板',
+      await evaluate(cdpAi, `!!document.querySelector('.agent.agent-standalone') && !document.querySelector('#body').offsetParent`)
+    )
+    check(
+      '已经聊过的内容被带进独立窗口',
+      await waitFor(cdpAi, `document.querySelectorAll('.agent-msg').length > 0`, '回放对话', 15000)
+    )
+    check(
+      '回复以卡片和渲染后的 Markdown 呈现',
+      await evaluate(cdpAi, `!!document.querySelector('.agent-msg.assistant.md p')`)
+    )
+    check(
+      '弹出去之后原来那个侧面板自己收起来（对话只有一个输入框）',
+      await waitFor(cdp, `document.querySelector('.pane.active .agent').style.display === 'none'`, '侧面板收起', 15000)
+    )
+    // Typing in the window reaches the same conversation, and the reply comes
+    // back here — that is the whole point of handing it over.
+    await evaluate(cdpAi, `(() => {
+      const box = document.querySelector('.agent-input')
+      box.value = '跑一下 echo 试试'
+      document.querySelector('.agent-go').click()
+    })()`)
+    check('在独立窗口里发的话，回复也落在独立窗口',
+      await waitFor(cdpAi, `document.querySelector('.agent-log').textContent.includes('跑完了')`, '独立窗口交互', 30000))
+    check('主窗口的侧面板没有跟着再长出一条新消息',
+      (await evaluate(cdp, `document.querySelectorAll('.pane.active .agent-log .agent-msg.user').length`)) === 0 ||
+        (await evaluate(cdp, `document.querySelector('.pane.active .agent').style.display === 'none'`)))
+    await evaluate(cdpAi, `document.querySelector('.panel-x').click()`)
+    await sleep(800)
+    check('独立窗口的 X 关掉窗口', !(await pages()).some((t) => t.type === 'page' && t.url.includes('agent=')))
+    cdpAi.close()
+  }
+
+  /* ---------------- saved conversations ---------------- */
+
+  // Everything sent above lands in a saved transcript, keyed by the connection
+  // rather than the tab: closing the tab keeps what was asked.
+  const history = JSON.parse(
+    await evaluate(cdp, `window.api.agentHistory('smoke').then(l => JSON.stringify(l))`)
+  )
+  check('聊过的话存进了这台机器的历史', history.length >= 1, `got ${history.length}`)
+  check('标题是这段对话里的第一句话', typeof history[0]?.title === 'string' && history[0].title.length > 0, JSON.stringify(history[0]))
+  check('别的机器看不到这段对话',
+    JSON.parse(await evaluate(cdp, `window.api.agentHistory('smoke-pw').then(l => JSON.stringify(l))`)).length === 0)
+
+  await evaluate(cdp, `document.querySelector('.pane.active [title="查看并导出这台机器的历史对话"]').click()`)
+  check('面板上的「历史」列出存下来的对话',
+    await waitFor(cdp, `document.querySelectorAll('#overlay .hist-item').length >= 1`, '历史列表'))
+  await evaluate(cdp, `document.querySelector('#overlay .hist-item').click()`)
+  check('打开一条历史能看到当时的提问',
+    await waitFor(cdp, `!!document.querySelector('#overlay .history-view .agent-msg.user')`, '历史正文'))
+  check('历史里的回复也是渲染过的 Markdown',
+    await evaluate(cdp, `!!document.querySelector('#overlay .history-view .agent-msg.assistant.md')`))
+  await evaluate(cdp, `[...document.querySelectorAll('#overlay .modal footer .btn')].find(b => b.textContent === '返回').click()`)
+  check('返回回到列表', await waitFor(cdp, `document.querySelectorAll('#overlay .hist-item').length >= 1`, '回到列表'))
+  await evaluate(cdp, `document.querySelector('#overlay').dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))`)
+  await waitFor(cdp, `document.querySelector('#overlay').hidden`, '历史面板关闭')
+
   /* ---------------- popped-out tab ---------------- */
 
   check('已连接的标签打着绿点', await evaluate(cdp, `!!document.querySelector('#tabs .tab.live .tdot')`))
@@ -2096,6 +2219,49 @@ async function main() {
       await waitFor(cdp, `!!document.querySelector('#tabs .tab.failed .tdot')`, '断开后的红点')
     )
   }
+
+  /* ---------------- panel dividers and the updater ---------------- */
+
+  // The monitor's divider: a drag has to change its width, not just look like a handle.
+  await evaluate(cdp, `document.querySelector('.pane.active [data-act="monitor"]').click()`)
+  await waitFor(cdp, `!!document.querySelector('.pane.active .monitor .panel-grip')`, '监控面板把手')
+  const widthBefore = await evaluate(cdp, `Math.round(document.querySelector('.pane.active .monitor').getBoundingClientRect().width)`)
+  await evaluate(cdp, `(() => {
+    const grip = document.querySelector('.pane.active .monitor .panel-grip')
+    const r = grip.getBoundingClientRect()
+    grip.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: r.left + 2, clientY: r.top + 40 }))
+    window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: r.left - 120, clientY: r.top + 40 }))
+    window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }))
+  })()`)
+  const widthAfter = await evaluate(cdp, `Math.round(document.querySelector('.pane.active .monitor').getBoundingClientRect().width)`)
+  check('拖监控面板左侧的分隔线能改宽度', widthAfter > widthBefore + 80, `${widthBefore} → ${widthAfter}`)
+  check(
+    '文件面板也有同一根分隔线',
+    await evaluate(cdp, `!!document.querySelector('.pane.active .files .panel-grip')`)
+  )
+  await evaluate(cdp, `document.querySelector('.pane.active [data-act="monitor"]').click()`)
+
+  await evaluate(cdp, `document.querySelector('#btn-settings').click()`)
+  await waitFor(cdp, `!!document.querySelector('#overlay .modal h2')?.textContent?.includes('设置')`, '开设置找更新')
+  check(
+    '设置里有检查更新，并显示当前版本',
+    await waitFor(cdp, `[...document.querySelectorAll('#overlay .modal .mon-sub')].some(s => /当前版本 \\d/.test(s.textContent))`, '版本号'),
+    await evaluate(cdp, `document.querySelector('#overlay .modal').textContent`)
+  )
+  await evaluate(cdp, `[...document.querySelectorAll('#overlay .modal button')].find(b => b.textContent === '检查更新').click()`)
+  check(
+    '检查更新会去问 GitHub，并把结果（新版/最新/失败）说出来',
+    await waitFor(
+      cdp,
+      `document.querySelector('#overlay .modal h2')?.textContent === '检查更新' &&
+       /(已经是最新版本|发现新版本|检查失败)/.test(document.querySelector('#overlay .modal .content').textContent)`,
+      '更新结果',
+      30000
+    ),
+    await evaluate(cdp, `document.querySelector('#overlay .modal .content').textContent`)
+  )
+  await evaluate(cdp, `[...document.querySelectorAll('#overlay .modal footer .btn')].find(b => b.textContent === '关闭').click()`)
+  await waitFor(cdp, `document.querySelector('#overlay').hidden`, '关掉两个对话框')
 
   // Last on purpose: this parks the window, so anything after it would have no
   // page left to talk to. The X has to be sent as WM_CLOSE, the message the

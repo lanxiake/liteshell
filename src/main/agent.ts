@@ -21,6 +21,7 @@ import { app } from 'electron'
 import type { AgentEvent, SessionEvent } from '../shared/types'
 import { gate, type Risk, type Verdict } from './gate'
 import { llmSettings } from './store'
+import * as history from './agenthistory'
 import { makeProvider, type Call, type Msg, type ToolResult, type ToolSpec } from './agent-providers'
 import type { CliServer, Req } from './cli-server'
 
@@ -44,7 +45,7 @@ const SYSTEM = [
   '',
   '规矩：',
   '- exec 打在用户自己那个终端里执行，目录就是它当下所在的目录，上一条命令里的 cd 会留着。要固定在某个位置就用绝对路径。',
-  '- exec 里只有「只看不改」的那一类不问就执行（ls / cat / grep / find / journalctl / ps / df / systemctl status 等）：一条命令、不带 && | > $() 这些。其余每一条都会让用户点一下，所以一次只做一件事——用 && 打包成串的命令会因为没法只批准其中一条而被拦下。',
+  '- exec 里只有会删除或覆盖数据的那一类（rm / mv / 重定向覆盖 / kill / 删库表等）才会停下来让用户确认；重启服务、改权限、装包、改配置这类可逆的改动直接执行。',
   '- 一条命令里不能有换行（终端一次只读一行）。要写多行就用 bash -c \'…\'，或者先落成脚本文件再跑。',
   '- 只读的 ls / cat / monitor 各自直接执行，不用等确认。要看机器状况先调 monitor，别用 top / free / df。',
   '- 输出过长会被截断，并给一个 handle，用 read_output 读回你要的那段。',
@@ -161,7 +162,7 @@ const TOOLS: Tool[] = [
       name: 'exec',
       description:
         '在远端执行一条 shell 命令。命令会打在用户正看着的那个终端里跑，所以别发需要交互的命令（vim、top、等输入的）—— 它们不会返回。' +
-        '改服务器只能靠它，所以用户每次都要确认。一次一条，别用 && 串起来。',
+        '会删除或覆盖数据的命令会先让用户确认；其余直接执行。一次一条，别用 && 串起来。',
       parameters: {
         type: 'object',
         properties: {
@@ -177,7 +178,7 @@ const TOOLS: Tool[] = [
   {
     spec: {
       name: 'mkdir',
-      description: '在远端创建目录。需要用户确认。',
+      description: '在远端创建目录。可逆，直接执行。',
       parameters: {
         type: 'object',
         properties: { path: { type: 'string' } },
@@ -190,7 +191,7 @@ const TOOLS: Tool[] = [
   {
     spec: {
       name: 'mv',
-      description: '在远端移动或重命名。需要用户确认。',
+      description: '在远端移动或重命名。会覆盖目标，需要用户确认。',
       parameters: {
         type: 'object',
         properties: { from: { type: 'string' }, to: { type: 'string' } },
@@ -322,6 +323,9 @@ interface Talk {
   running: boolean
   /** Which endpoint this transcript is written in. Empty until the first turn. */
   endpoint: string
+  /** The saved conversation this talk is appending to; null until it says
+   *  something, and again after a reset. */
+  conversationId: string | null
   controller?: AbortController
   pending?: { askId: string; resolve: (d: Decision) => void }
 }
@@ -338,6 +342,9 @@ export class AgentRunner {
   send(sessionId: string, connectionId: string, text: string, files: string[] = []): void {
     const talk = this.talkFor(sessionId, connectionId)
     if (talk.running) return
+    // Echoed from here, not drawn by the window that typed it: a second window
+    // on the same conversation, and the saved transcript, both need this line.
+    this.push(talk, { kind: 'user', text, ...(files.length ? { files } : {}) })
     if (files.length) {
       // Uploaded before the turn starts: the model is handed real paths it can
       // read with its own tools, which also means a 40 MB log costs nothing
@@ -444,6 +451,7 @@ export class AgentRunner {
     talk.pending?.resolve({ allowed: false, stopped: true })
     talk.pending = undefined
     talk.messages = []
+    talk.conversationId = null
   }
 
   forget(sessionId: string): void {
@@ -456,12 +464,22 @@ export class AgentRunner {
     // A conversation belongs to one machine. A tab that got reused for another
     // connection must not carry the old one's transcript onto the new host.
     if (existing && existing.connectionId === connectionId) return existing
-    const talk: Talk = { sessionId, connectionId, messages: [], running: false, endpoint: '' }
+    const talk: Talk = {
+      sessionId,
+      connectionId,
+      messages: [],
+      running: false,
+      endpoint: '',
+      conversationId: null
+    }
     this.talks.set(sessionId, talk)
     return talk
   }
 
   private push(talk: Talk, event: AgentEvent): void {
+    // The saved copy and the live windows are written from the same event, so
+    // what the history list shows is what was on screen.
+    talk.conversationId = history.append(talk.conversationId, talk.connectionId, event)
     this.emit({ type: 'agent', sessionId: talk.sessionId, event })
   }
 

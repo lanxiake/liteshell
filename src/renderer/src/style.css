@@ -179,6 +179,13 @@ body[data-platform="mac"] #titlebar {
   background: transparent;
 }
 
+/* Folded away: the list is gone, and so is the divider that only resized it.
+   The titlebar button is the way back, so nothing is lost. */
+body.side-off #sidebar,
+body.side-off #resizer {
+  display: none;
+}
+
 #resizer:hover {
   background: var(--accent-dim);
 }
@@ -215,6 +222,14 @@ body[data-platform="mac"] #titlebar {
 
 .node.drop {
   outline: 1px dashed var(--accent);
+}
+
+.node.dragging {
+  opacity: 0.45;
+}
+
+.node.sel {
+  background: var(--bg-active);
 }
 
 .node .label {
@@ -428,6 +443,7 @@ body[data-platform="mac"] #titlebar {
   border-left: 1px solid var(--border);
   background: var(--bg);
   min-width: 280px;
+  position: relative;
 }
 
 .files.open {
@@ -448,6 +464,43 @@ body[data-platform="mac"] #titlebar {
   height: 24px;
   padding: 0 6px;
   font-size: 11px;
+}
+
+/* The divider between the terminal and any side panel. It straddles the
+   panel's own left edge, so it costs no layout width and cannot end up as a
+   dead stripe when the panel is closed. */
+.panel-grip {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 5px;
+  cursor: col-resize;
+  z-index: 3;
+}
+
+.panel-grip:hover {
+  background: var(--accent);
+  opacity: 0.35;
+}
+
+/* The X every side panel carries, pinned to its top-right corner. */
+.panel-x {
+  margin-left: auto;
+  flex: none;
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  font-size: 16px;
+  line-height: 1;
+  color: var(--text-dim);
+}
+
+.panel-x:hover {
+  background: var(--bg-hover);
+  color: var(--text);
 }
 
 /* ---------- path bar ---------- */
@@ -680,13 +733,37 @@ body[data-platform="mac"] #titlebar {
   flex: 0 0 336px;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
+  border-left: 1px solid var(--border);
+  background: var(--bg);
+  min-width: 300px;
+  position: relative;
+}
+
+.mon-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  padding: 5px 6px 5px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.mon-head-title {
+  flex: 1;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+/* Only the readings scroll; the title and its X stay put. */
+.mon-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
   gap: 8px;
   padding: 10px 12px 12px;
   overflow: auto;
   scrollbar-width: thin;
-  border-left: 1px solid var(--border);
-  background: var(--bg);
-  min-width: 300px;
 }
 
 /* The warning strip sits on top: "is anything wrong" is the first question. */
@@ -899,6 +976,46 @@ body[data-platform="mac"] #titlebar {
   white-space: nowrap;
 }
 
+/* A trend line, then the two rates, then the running total. The line gets the
+   flexible column: it is the only thing here whose size is worth giving up. */
+.mon-net {
+  display: grid;
+  grid-template-columns: minmax(48px, auto) minmax(40px, 1fr) auto;
+  grid-template-areas:
+    'name spark rate'
+    'name spark total';
+  align-items: center;
+  gap: 0 8px;
+}
+
+.mon-net .mon-name {
+  grid-area: name;
+}
+
+.net-spark {
+  grid-area: spark;
+  width: 100%;
+  height: 22px;
+  display: block;
+}
+
+.mon-net .mon-val {
+  grid-area: rate;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.mon-net .mon-sub {
+  grid-area: total;
+  font-size: 10px;
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-faint);
+}
+
 .badge {
   flex: none;
   font-size: 10px;
@@ -956,6 +1073,54 @@ body[data-platform="mac"] #titlebar {
   display: none;
 }
 
+/* ---------- ai panel in its own window ---------- */
+
+/* Only the terminal chrome goes. #overlay stays: the history list and the
+   export dialog are modals, and this window has them too. */
+body.agent-popout > #titlebar,
+body.agent-popout > #body,
+body.agent-popout > #statusbar {
+  display: none;
+}
+
+.agent.agent-standalone {
+  flex: 1;
+  width: auto;
+  min-width: 0;
+  border-left: none;
+}
+
+/* The OS caption buttons are drawn over the page: the header keeps clear of
+   them and doubles as the drag strip, with its own buttons opting out. */
+.agent-standalone .agent-head {
+  -webkit-app-region: drag;
+  height: var(--titlebar-h);
+  padding: 0 12px;
+}
+
+body[data-platform="win"] .agent-standalone .agent-head,
+body[data-platform="linux"] .agent-standalone .agent-head {
+  padding-right: 148px;
+}
+
+body[data-platform="mac"] .agent-standalone .agent-head {
+  padding-left: 80px;
+}
+
+.agent-standalone .agent-head button {
+  -webkit-app-region: no-drag;
+}
+
+/* Room to read: the side panel is 520px because it shares the row, this one
+   has the window, so the text gets a measure rather than the full width. */
+.agent-standalone .agent-log {
+  padding: 16px max(16px, calc((100% - 860px) / 2));
+}
+
+.agent-standalone .agent-compose {
+  padding: 8px max(12px, calc((100% - 884px) / 2)) 16px;
+}
+
 .agent-head {
   display: flex;
   align-items: center;
@@ -992,6 +1157,65 @@ body[data-platform="mac"] #titlebar {
   border-color: var(--accent);
 }
 
+/* A saved conversation: a list of what was asked, then the transcript itself. */
+.hist-list {
+  display: grid;
+  gap: 4px;
+  max-height: 60vh;
+  overflow: auto;
+  scrollbar-width: thin;
+}
+
+.hist-item {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 7px 9px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  text-align: left;
+}
+
+.hist-item:hover {
+  background: var(--bg-hover);
+  border-color: var(--border);
+}
+
+.hist-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hist-when {
+  flex: none;
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.hist-body {
+  max-height: 60vh;
+  overflow: auto;
+  scrollbar-width: thin;
+}
+
+/* The archived view has no composer under it and no fixed height to fill. */
+.history-view {
+  max-height: none;
+  padding: 0;
+}
+
+/* Read-only transcript: the approval box shows the command, not an editor. */
+.agent-ask pre.agent-ask-cmd {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  overflow: auto;
+}
+
 .agent-log {
   flex: 1;
   overflow: auto;
@@ -1013,10 +1237,15 @@ body[data-platform="mac"] #titlebar {
   overflow-wrap: anywhere;
 }
 
+/* What you said, as a card on your side — the one thing in this panel that is
+   not the machine reporting on itself. */
 .agent-msg.user {
+  align-self: flex-end;
+  max-width: 92%;
+  padding: 6px 10px;
+  border-radius: 8px 8px 2px 8px;
+  background: color-mix(in srgb, var(--accent) 14%, var(--bg));
   color: var(--text);
-  border-left: 2px solid var(--accent);
-  padding-left: 8px;
 }
 
 .agent-hint {
@@ -1025,8 +1254,97 @@ body[data-platform="mac"] #titlebar {
   color: var(--text-faint);
 }
 
+/* The answer is the other card. While it streams it is plain text; once the
+   turn is complete the same node is filled with rendered Markdown. */
 .agent-msg.assistant {
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-panel);
   color: var(--text);
+}
+
+.agent-msg.assistant.streaming::after {
+  content: "▍";
+  color: var(--accent);
+  animation: agent-caret 1s step-end infinite;
+}
+
+@keyframes agent-caret {
+  50% {
+    opacity: 0;
+  }
+}
+
+/* Markdown. Element margins are reset to the card's own rhythm: a model that
+   writes six paragraphs should not triple the height of its answer. */
+.agent-msg.md {
+  white-space: normal;
+}
+
+.agent-msg.md > :first-child {
+  margin-top: 0;
+}
+
+.agent-msg.md > :last-child {
+  margin-bottom: 0;
+}
+
+.agent-msg.md p {
+  margin: 0 0 6px;
+  white-space: pre-wrap;
+}
+
+.agent-msg.md .md-h {
+  margin: 10px 0 4px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.agent-msg.md h1.md-h {
+  font-size: 14px;
+}
+
+.agent-msg.md .md-list {
+  margin: 4px 0;
+  padding-left: 20px;
+}
+
+.agent-msg.md li {
+  margin: 2px 0;
+}
+
+.agent-msg.md .md-pre {
+  margin: 6px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  overflow: auto;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.agent-msg.md code {
+  font-family: "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
+}
+
+.agent-msg.md .md-code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--bg-hover);
+  font-size: 0.92em;
+}
+
+.agent-msg.md .md-quote {
+  margin: 6px 0;
+  padding-left: 10px;
+  border-left: 2px solid var(--border);
+  color: var(--text-dim);
+}
+
+.agent-msg.md .md-link {
+  color: var(--accent);
 }
 
 .agent-msg.tool {
@@ -1332,6 +1650,25 @@ body[data-platform="mac"] #titlebar {
   border-top: 1px solid var(--border);
   font-size: 11px;
   color: var(--text-dim);
+}
+
+/* Release notes: Markdown from GitHub, shown as text — it is prose, and the
+   dialog is not a browser. */
+.update-notes {
+  margin: 0;
+  max-height: 240px;
+  overflow: auto;
+  scrollbar-width: thin;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 /* ---------- theme picker ---------- */

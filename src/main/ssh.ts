@@ -4,10 +4,11 @@ import { basename, dirname, join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { Client, type ClientChannel, type SFTPWrapper } from 'ssh2'
 import { MONITOR_SCRIPT, parseMonitor } from './monitor'
+import { bindAddress, probeLatency } from './localnet'
 import { decodeText, looksLikeText } from './textfile'
 import type { MonitorSnapshot, RemoteText, SaveResult, Transfer } from '../shared/types'
 import type { Connection, SessionEvent, SessionInfo, SessionStatus, SftpEntry } from '../shared/types'
-import { hostKey, keySecretOf, rememberHostKey, secretOf, store } from './store'
+import { hostKey, keySecretOf, legacyHostKey, rememberHostKey, secretOf, store } from './store'
 
 type Emit = (ev: SessionEvent) => void
 
@@ -79,16 +80,25 @@ class Session {
 
   connect(cols: number, rows: number): void {
     const c = this.conn
+    // Resolved here, once, so the log line and the socket agree on the answer.
+    const source = bindAddress(c)
     const opts: Parameters<Client['connect']>[0] = {
       host: c.host,
       port: c.port,
       username: c.username,
       readyTimeout: 20_000,
       keepaliveInterval: c.keepalive > 0 ? c.keepalive * 1000 : 0,
+      // Two VPNs can carry the same remote subnet; binding the source address
+      // picks the tunnel instead of letting the routing table decide. An
+      // interface name is resolved now, so a reconnected tunnel still matches.
+      ...(source ? { localAddress: source } : {}),
       hostVerifier: (key: Buffer) => this.verifyHostKey(key),
       // Handshake detail goes to the log panel. It stops once the session is up,
       // so what you read after a failure is exactly the part that failed.
       debug: (msg: string) => this.log('debug', msg)
+    }
+    if (c.localIface && !source) {
+      this.log('warn', `本机网卡 ${c.localIface} 现在没有地址（VPN 断了？），这次不绑定出口`)
     }
 
     // A key's own passphrase is the fallback: connections reusing the same key
@@ -154,21 +164,27 @@ class Session {
   }
 
   /**
-   * Trust-on-first-use. A brand new key is learned and reported; a key that
-   * changes for a host we already know is refused outright.
+   * Trust-on-first-use, pinned per connection profile rather than per address:
+   * two environments can share an IP and each gets its own key. A key that
+   * changes for a profile we already know is refused outright.
    */
   private verifyHostKey(key: Buffer): boolean {
     const fingerprint = 'SHA256:' + createHash('sha256').update(key).digest('base64').replace(/=+$/, '')
-    const known = hostKey(this.conn.host, this.conn.port)
-    if (!known) {
-      rememberHostKey(this.conn.host, this.conn.port, fingerprint)
-      this.emit({ type: 'hostkey', sessionId: this.id, fingerprint, known: false, changed: false })
+    const known = hostKey(this.conn.id)
+    if (known) {
+      if (known !== fingerprint) {
+        this.emit({ type: 'hostkey', sessionId: this.id, fingerprint, known: true, changed: true })
+        return false
+      }
       return true
     }
-    if (known !== fingerprint) {
-      this.emit({ type: 'hostkey', sessionId: this.id, fingerprint, known: true, changed: true })
-      return false
-    }
+    // A record from before per-connection pinning has no owner, so it is only
+    // adopted when it names this exact key; otherwise this profile is meeting
+    // the host for the first time and gets the usual first-contact trust.
+    const legacy = legacyHostKey(this.conn.host, this.conn.port)
+    rememberHostKey(this.conn, fingerprint)
+    if (legacy === fingerprint) return true
+    this.emit({ type: 'hostkey', sessionId: this.id, fingerprint, known: false, changed: false })
     return true
   }
 
@@ -366,10 +382,33 @@ class Session {
   }
 
   async monitor(): Promise<MonitorSnapshot> {
+    // The link probe runs beside the sampling, not after it: it is an
+    // independent TCP handshake, and waiting for the 1-second sleep first would
+    // make a slow line look like a slow server.
+    const probe = this.probeLatency()
     const { stdout, stderr } = await this.exec(MONITOR_SCRIPT)
     // The script is silent when it cannot run at all — say why instead of parsing "".
     if (!stdout.trim()) throw new Error(stderr.trim() || '监控脚本没有输出')
-    return parseMonitor(stdout)
+    const snapshot = parseMonitor(stdout)
+    snapshot.latency = { rtt: await probe }
+    return snapshot
+  }
+
+  private rtt = { at: 0, value: -1 }
+
+  /**
+   * Every probe is a TCP handshake sshd logs as "connection closed [preauth]",
+   * so it runs every half minute rather than on every 2-second poll. A failed
+   * probe is not cached: the line may come back before the next poll does.
+   */
+  private probeLatency(): Promise<number> {
+    if (this.rtt.value >= 0 && Date.now() - this.rtt.at < 30_000) {
+      return Promise.resolve(this.rtt.value)
+    }
+    return probeLatency(this.conn.host, this.conn.port, bindAddress(this.conn)).then((rtt) => {
+      if (rtt >= 0) this.rtt = { at: Date.now(), value: rtt }
+      return rtt
+    })
   }
 
   /**

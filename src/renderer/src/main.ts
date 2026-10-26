@@ -12,6 +12,7 @@ import {
   type Suggestion
 } from './commands'
 import { alertsFor, toneOf, usePct, type Tone } from './alerts'
+import { renderMarkdown } from './markdown'
 import type {
   AgentEvent,
   Connection,
@@ -349,19 +350,29 @@ function $(sel: string): HTMLElement {
   return document.querySelector(sel) as HTMLElement
 }
 
-function el<K extends keyof HTMLElementTagNameMap>(
-  tag: K,
-  cls = '',
-  text = ''
-): HTMLElementTagNameMap[K] {
+const el = ((tag: string, cls = '', text = ''): HTMLElement => {
   const node = document.createElement(tag)
   if (cls) node.className = cls
   if (text) node.textContent = text
   return node
-}
+}) as (<K extends keyof HTMLElementTagNameMap>(
+  tag: K,
+  cls?: string,
+  text?: string
+) => HTMLElementTagNameMap[K]) & ((tag: string, cls?: string, text?: string) => HTMLElement)
 
 function uid(): string {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4)
+}
+
+/** The X on every side panel. The toolbar button that opened a panel sits at
+ *  the far left, so closing it from the panel itself is the short way out. */
+function panelClose(title: string, run: () => void): HTMLElement {
+  const b = el('button', 'panel-x', '×')
+  b.title = title
+  b.setAttribute('aria-label', title)
+  b.addEventListener('click', run)
+  return b
 }
 
 function human(bytes: number): string {
@@ -452,18 +463,68 @@ async function boot(): Promise<void> {
 
   store = await api.getStore()
   applySettings(store.settings)
+
+  // ?agent=<session>&conn=<connection>: this window holds only the AI panel.
+  const params = new URLSearchParams(location.search)
+  const onlyAgent = params.get('agent')
+  if (onlyAgent) {
+    await bootAgentWindow(onlyAgent, params.get('conn') ?? '')
+    return
+  }
+
   renderTree()
   wireChrome()
   // Registered before attaching: main starts replaying buffered events the
   // moment the attach call lands.
   api.onSessionEvent(handleEvent)
+  api.onAgentCleared((sid) => {
+    const session = sessions.get(sid)
+    if (session?.agent) clearAgentView(session.agent)
+  })
 
   // ?attach=<session>&conn=<connection>: this window was opened around a tab
   // that is already connected somewhere else.
-  const params = new URLSearchParams(location.search)
   const attach = params.get('attach')
   const conn = store.connections.find((c) => c.id === params.get('conn'))
   if (attach && conn) await openSession(conn, attach)
+}
+
+/**
+ * The AI panel in its own window. There is no terminal here — the conversation
+ * is the whole page — so the panel is wired with a stand-in for the session
+ * that carries only what `wireAgent` reads: the two ids and the view.
+ */
+async function bootAgentWindow(sessionId: string, connectionId: string): Promise<void> {
+  document.body.classList.add('agent-popout')
+  const view = buildAgent(true)
+  view.sessionId = sessionId
+  view.connectionId = connectionId
+  document.body.append(view.root)
+  const session = { id: sessionId, connectionId, agent: view } as unknown as Session
+  wireAgent(session)
+  syncAgentEntry(session)
+
+  // Registered before attaching, like the terminal window; anything that lands
+  // while the transcript is replayed is queued instead of landing out of order.
+  let replaying = true
+  const queued: AgentEvent[] = []
+  api.onSessionEvent((ev) => {
+    if (ev.type !== 'agent' || ev.sessionId !== sessionId) return
+    if (replaying) queued.push(ev.event)
+    else renderAgent(session, ev.event)
+  })
+  api.onAgentCleared((sid) => {
+    if (sid === sessionId) clearAgentView(view)
+  })
+
+  const history = await api.attachAgentWindow(sessionId)
+  for (const ev of history) renderAgent(session, ev)
+  // Every turn ends with `done`; anything else last means it is still running
+  // and this window opened in the middle of it.
+  if (history.length && history[history.length - 1].kind !== 'done') setAgentBusy(view, true)
+  replaying = false
+  for (const ev of queued) renderAgent(session, ev)
+  view.input.focus()
 }
 
 function applySettings(settings: Settings): void {
@@ -495,6 +556,11 @@ function applySettings(settings: Settings): void {
  * connection tree
  * ------------------------------------------------------------------ */
 
+/** Which item in the tree the user last clicked. A click selects; it does not
+ *  connect — the tree is a list of machines, and opening one used to happen
+ *  because the pointer landed on a name. */
+let selectedId: string | null = null
+
 function renderTree(): void {
   const tree = $('#tree')
   tree.replaceChildren()
@@ -517,9 +583,46 @@ function renderTree(): void {
       const node = el('div', 'node')
       if (live) node.classList.add('live')
       if (failed) node.classList.add('failed')
+      if (item.id === selectedId) node.classList.add('sel')
       node.style.paddingLeft = `${8 + depth * 14}px`
       node.dataset.id = item.id
       node.dataset.kind = isFolder ? 'folder' : 'connection'
+      node.draggable = true
+
+      node.addEventListener('dragstart', (ev) => {
+        dragId = item.id
+        node.classList.add('dragging')
+        // Some payload is required for the drag to start in Chromium; the
+        // value itself is only cosmetic.
+        ev.dataTransfer?.setData('text/plain', item.name)
+        if (ev.dataTransfer) ev.dataTransfer.effectAllowed = 'move'
+      })
+      node.addEventListener('dragend', () => {
+        dragId = null
+        node.classList.remove('dragging')
+        for (const n of tree.querySelectorAll('.node.drop')) n.classList.remove('drop')
+      })
+      // Dropping onto a folder means "into it"; dropping onto a connection
+      // means "into the folder that connection lives in", which is what makes
+      // the flat rows above it usable as targets too.
+      const dropTarget = (): string | null =>
+        isFolder ? item.id : ((item as Connection).folderId ?? null)
+      node.addEventListener('dragover', (ev) => {
+        if (!dragId || dragId === item.id) return
+        if (!canMove(dragId, dropTarget())) return
+        ev.preventDefault()
+        node.classList.add('drop')
+      })
+      node.addEventListener('dragleave', () => node.classList.remove('drop'))
+      node.addEventListener('drop', (ev) => {
+        ev.preventDefault()
+        ev.stopPropagation()
+        node.classList.remove('drop')
+        if (!dragId) return
+        const id = dragId
+        dragId = null
+        void moveInto(id, dropTarget())
+      })
 
       if (isFolder && !collapsed.has(item.id)) {
         const chev = el('span', 'chev open', '▶')
@@ -536,15 +639,28 @@ function renderTree(): void {
       }
 
       node.addEventListener('click', () => {
+        selectedId = item.id
         if (isFolder) {
           collapsed.has(item.id) ? collapsed.delete(item.id) : collapsed.add(item.id)
           renderTree()
-        } else {
-          void openSession(item as Connection)
+          return
         }
+        // Patched in place rather than re-rendering: replacing the node under
+        // the pointer between the two clicks is what stops a double click from
+        // ever being one.
+        for (const n of tree.querySelectorAll('.node.sel')) n.classList.remove('sel')
+        node.classList.add('sel')
+      })
+      // Double click is the "open" gesture, and for a folder it is just a
+      // second toggle, which is why folders do not get one.
+      node.addEventListener('dblclick', () => {
+        if (!isFolder) void openSession(item as Connection)
       })
       node.addEventListener('contextmenu', (ev) => {
         ev.preventDefault()
+        selectedId = item.id
+        for (const n of tree.querySelectorAll('.node.sel')) n.classList.remove('sel')
+        node.classList.add('sel')
         treeMenu(ev, item, isFolder, item.id)
       })
 
@@ -560,6 +676,51 @@ function renderTree(): void {
     hint.innerHTML = '还没有连接<br />点右上角 <b>＋</b> 新建'
     tree.appendChild(hint)
   }
+}
+
+/** The item being dragged. Kept here rather than in dataTransfer, which has
+ *  the value only during drop and not during dragover — where the decision to
+ *  accept the drop has to be made. */
+let dragId: string | null = null
+
+/** A folder cannot be dropped into itself or anything below it: that detaches
+ *  the subtree from the tree entirely, and the store has no way to say so. */
+function canMove(id: string, intoFolderId: string | null): boolean {
+  if (id === intoFolderId) return false
+  const folder = store.folders.find((f) => f.id === id)
+  if (!folder) return true
+  let parent = intoFolderId
+  while (parent) {
+    if (parent === id) return false
+    parent = store.folders.find((f) => f.id === parent)?.parentId ?? null
+  }
+  return true
+}
+
+/** Moves a connection or folder into a folder (null = the root). */
+async function moveInto(id: string, folderId: string | null): Promise<void> {
+  const conn = store.connections.find((c) => c.id === id)
+  if (conn) {
+    if (conn.folderId === folderId) return
+    const { hasSecret: _h, secret: _s, ...rest } = conn
+    await api.saveConnection({ ...rest, folderId }, null)
+  } else {
+    const folder = store.folders.find((f) => f.id === id)
+    if (!folder) return
+    await api.saveFolder({ ...folder, parentId: folderId })
+  }
+  await refreshStore()
+}
+
+/** The tree's own menu: right-click anywhere that is not a node. */
+function emptyTreeMenu(ev: MouseEvent): void {
+  showMenu(ev.clientX, ev.clientY, [
+    { label: '新建连接', run: () => connDialog(null, null) },
+    { label: '新建文件夹', run: () => folderDialog(null, null) },
+    { sep: true },
+    { label: '导入 FinalShell…', run: () => transferMenu(ev) },
+    { label: '导入 LiteShell 备份…', run: () => void importBundleDialog() }
+  ])
 }
 
 function treeMenu(ev: MouseEvent, item: Folder | Connection, isFolder: boolean, id: string): void {
@@ -608,12 +769,12 @@ async function passwordlessDialog(conn: Connection): Promise<void> {
     const r = await api.setupPasswordless(conn.id, picked.secret)
     // The setup just proved the password works, so it is safe to remember now.
     if (picked.secret && picked.remember) await persistSecret(conn, picked.secret)
-    log('info', `[${conn.name}] 已配置免密登录：ssh ${r.host}`)
+    log('info', `[${conn.name}] 已配置免密登录：ssh ${r.alias}`)
     const body = el('div')
     body.style.display = 'grid'
     body.style.gap = '6px'
     body.append(
-      el('div', '', `本机终端里现在可以直接运行：ssh ${r.host}`),
+      el('div', '', `本机终端里现在可以直接运行：ssh ${r.alias}`),
       el('div', 'mon-sub', `${r.username}@${r.host}:${r.port}`),
       el('div', 'mon-sub', `私钥 ${r.keyPath}`),
       el('div', 'mon-sub', `配置 ${r.configPath}`),
@@ -627,7 +788,7 @@ async function passwordlessDialog(conn: Connection): Promise<void> {
       el('div', 'mon-sub', '私钥没有口令，请像密码一样保管它。')
     )
     showModal('免密登录已配置', body, [
-      { label: '复制命令', onClick: () => copyText(`ssh ${r.host}`, '命令') },
+      { label: '复制命令', onClick: () => copyText(`ssh ${r.alias}`, '命令') },
       { label: '好', primary: true, onClick: closeModal }
     ])
   } catch (err) {
@@ -876,6 +1037,25 @@ function connDialog(existing: Connection | null, folderId: string | null): void 
   const host = input(draft.host)
   const port = input(String(draft.port), 'number')
   const username = input(draft.username)
+  const localAddress = input(draft.localAddress ?? '')
+  const localIface = select([['', '（不指定）']], draft.localIface ?? '')
+  // Filled from the machine, not remembered: a tunnel gets a new address after
+  // a reconnect, and the name is the half that stays true.
+  void api.netInterfaces().then((list) => {
+    for (const it of list) {
+      const opt = el('option', '', `${it.name} — ${it.address}`)
+      opt.value = it.name
+      localIface.appendChild(opt)
+    }
+    // A tunnel that is down right now is still a valid setting; dropping it
+    // silently would quietly unbind the connection on the next save.
+    if (draft.localIface && !list.some((it) => it.name === draft.localIface)) {
+      const opt = el('option', '', `${draft.localIface}（当前无地址）`)
+      opt.value = draft.localIface
+      localIface.appendChild(opt)
+    }
+    localIface.value = draft.localIface ?? ''
+  })
   const auth = select(
     [
       ['password', '密码'],
@@ -968,6 +1148,8 @@ function connDialog(existing: Connection | null, folderId: string | null): void 
       grid.append(field('用户名', username), field('保活(秒)', keepalive))
       return grid
     })(),
+    field('本机网卡（推荐，VPN 换地址后自动跟）', localIface),
+    field('本机地址（可选，填了就固定用这个出口，如 10.7.8.7）', localAddress),
     field('认证方式', auth),
     secretField,
     keyField,
@@ -991,6 +1173,8 @@ function connDialog(existing: Connection | null, folderId: string | null): void 
           host: host.value.trim(),
           port: Number(port.value) || 22,
           username: username.value.trim(),
+          localAddress: localAddress.value.trim() || undefined,
+          localIface: localIface.value || undefined,
           authType: auth.value as Connection['authType'],
           privateKeyPath: keyValue.trim() || undefined,
           agentSocket: agentSocket.value.trim() || undefined,
@@ -1059,7 +1243,6 @@ function settingsDialog(): void {
   )
   const scrollback = input(String(s.scrollback), 'number')
   const copyOnSelect = select([['1', '开'], ['0', '关']], s.copyOnSelect ? '1' : '0')
-  const rightClick = select([['1', '开'], ['0', '关']], s.rightClickPaste ? '1' : '0')
 
   const llm = s.llm ?? { provider: 'anthropic' as const, baseUrl: '', model: '', hasKey: false }
   const provider = select(
@@ -1184,7 +1367,7 @@ function settingsDialog(): void {
     })(),
     (() => {
       const grid = el('div', 'grid2')
-      grid.append(field('选中即复制', copyOnSelect), field('右键粘贴', rightClick))
+      grid.append(field('选中即复制', copyOnSelect))
       return grid
     })(),
     el('div', 'field-sep', 'AI 助手'),
@@ -1192,7 +1375,17 @@ function settingsDialog(): void {
     field('接口地址', urlRow),
     field('模型', modelRow),
     note,
-    field('API Key', keyRow)
+    field('API Key', keyRow),
+    el('div', 'field-sep', '更新'),
+    (() => {
+      const row = el('div', 'row-inline')
+      const check = el('button', 'btn', '检查更新')
+      check.addEventListener('click', () => void updateDialog())
+      const version = el('span', 'mon-sub', '')
+      void api.appVersion().then((v) => (version.textContent = `当前版本 ${v}`))
+      row.append(check, version)
+      return row
+    })()
   )
 
   showModal('设置', body, [
@@ -1217,7 +1410,7 @@ function settingsDialog(): void {
           cursorBlink: blink.value === '1',
           scrollback: Number(scrollback.value) || 5000,
           copyOnSelect: copyOnSelect.value === '1',
-          rightClickPaste: rightClick.value === '1',
+          sidebarCollapsed: s.sidebarCollapsed,
           // Not in this dialog; carried through so saving does not undo a drag.
           agentWidth: s.agentWidth,
           llm: {
@@ -1237,6 +1430,104 @@ function settingsDialog(): void {
       }
     }
   ])
+}
+
+/* ------------------------------------------------------------------ *
+ * updates
+ * ------------------------------------------------------------------ */
+
+/**
+ * The update flow, all in one dialog: check, read what changed, download, run
+ * the installer. Deliberately manual — an app that calls `app.quit()` because a
+ * tag moved under it is an app that closes a session somebody was in the middle
+ * of using.
+ */
+async function updateDialog(): Promise<void> {
+  const body = el('div')
+  body.style.display = 'grid'
+  body.style.gap = '10px'
+  const status = el('div', 'mon-sub', '正在检查 GitHub 上的最新版本…')
+  body.append(status)
+  // Registered up front so a download started from a previous dialog — or a
+  // second press — still finds its listener.
+  let fill: HTMLElement | null = null
+  let hint: HTMLElement | null = null
+  api.onUpdateProgress((received, total) => {
+    if (!fill || !hint) return
+    const pct = total > 0 ? Math.round((received / total) * 100) : 0
+    fill.style.width = `${pct}%`
+    hint.textContent = `${human(received)} / ${total ? human(total) : '?'}（${pct}%）`
+  })
+  showModal('检查更新', body, [
+    { label: '打开发布页', onClick: () => void api.updateReleasesUrl() },
+    { label: '关闭', primary: true, onClick: closeModal }
+  ])
+
+  const result = await api.updateCheck()
+  if (result.kind === 'error') {
+    status.textContent = `检查失败：${result.message}`
+    status.classList.add('tone-danger')
+    return
+  }
+  if (result.kind === 'latest') {
+    status.textContent = `已经是最新版本（${result.current}）。`
+    return
+  }
+
+  status.textContent = `发现新版本 ${result.latest}（当前 ${result.current}）`
+  status.classList.remove('tone-danger')
+
+  if (result.notes) {
+    const notes = el('pre', 'update-notes', result.notes)
+    body.append(notes)
+  }
+
+  if (!result.asset) {
+    body.append(
+      el('div', 'mon-sub', '这个版本没有为你的系统提供安装包，去发布页手动下载吧。')
+    )
+    return
+  }
+
+  const progress = el('div', 'pbar')
+  fill = el('div', 'pbar-fill')
+  progress.append(fill)
+  progress.hidden = true
+  hint = el('div', 'mon-sub', '')
+  body.append(progress, hint)
+
+  const download = el('button', 'btn primary', '下载并安装')
+  body.append(download)
+
+  let downloaded: string | null = null
+
+  download.addEventListener('click', () => {
+    if (downloaded) {
+      // Second press: the file is already on disk, so this one runs it.
+      void api.updateInstall(downloaded)
+      closeModal()
+      return
+    }
+    download.disabled = true
+    progress.hidden = false
+    hint!.textContent = '开始下载…'
+    api
+      .updateDownload()
+      .then((path) => {
+        downloaded = path
+        fill!.style.width = '100%'
+        hint!.textContent = '下载完成，校验通过。再点一次开始安装 —— 应用会先退出。'
+        download.disabled = false
+        download.textContent = '安装并退出'
+        download.classList.remove('primary')
+        download.classList.add('danger')
+      })
+      .catch((err) => {
+        download.disabled = false
+        hint!.textContent = `下载失败：${(err as Error).message}`
+        hint!.classList.add('tone-danger')
+      })
+  })
 }
 
 /* ------------------------------------------------------------------ *
@@ -1894,6 +2185,35 @@ function settleSecret(sessionId: string, sessionName: string): void {
  *   prompt and no connect call then: this only puts a tab and a terminal around a
  *   session that is already up, so the user can watch or take it over.
  */
+/** A drag handle on a side panel's left edge. Dragging left widens the panel —
+ *  the handle belongs to the panel, not to the terminal it is stealing from,
+ *  which is why it sits on the panel's side of the divider. */
+function sideGrip(host: HTMLElement, min: number, set: (width: number) => void): HTMLElement {
+  const grip = el('div', 'panel-grip')
+  grip.title = '拖动调整面板宽度'
+  grip.addEventListener('mousedown', (down: MouseEvent) => {
+    down.preventDefault()
+    const startX = down.clientX
+    const startW = host.getBoundingClientRect().width
+    const fit = (): void => sessions.get(activeId ?? '')?.fit.fit()
+    const move = (ev: MouseEvent): void => {
+      // Leave the terminal room to stay usable; 320px is roughly 40 columns.
+      const width = Math.min(window.innerWidth - 320, Math.max(min, startW + startX - ev.clientX))
+      set(width)
+      fit()
+    }
+    const up = (): void => {
+      window.removeEventListener('mousemove', move)
+      window.removeEventListener('mouseup', up)
+      fit()
+    }
+    window.addEventListener('mousemove', move)
+    window.addEventListener('mouseup', up)
+  })
+  host.append(grip)
+  return grip
+}
+
 async function openSession(rawConn: Connection, externalId?: string): Promise<void> {
   const picked = externalId ? { conn: rawConn, secret: '' } : await withSecret(rawConn)
   if (!picked) return
@@ -1955,6 +2275,10 @@ async function openSession(rawConn: Connection, externalId?: string): Promise<vo
 
   termRow.append(termBox, files, monitor.root)
   if (agent) termRow.append(agent.root)
+  // The file panel opens at 42% and the monitor at a fixed width; both follow
+  // this handle afterwards, for the rest of the session.
+  sideGrip(files, 280, (w) => (files.style.flex = `0 0 ${w}px`))
+  sideGrip(monitor.root, 300, (w) => (monitor.root.style.flex = `0 0 ${w}px`))
   // The suggestion list is the last row of the pane on purpose: it opens *under*
   // the prompt line like an IME candidate bar, and because it takes part in the
   // flex layout it shrinks the terminal instead of covering what you were reading.
@@ -1989,6 +2313,10 @@ async function openSession(rawConn: Connection, externalId?: string): Promise<vo
     suggestIndex: -1
   }
 
+  monitor.close.addEventListener('click', () => {
+    if (monitor.root.style.display !== 'none') toggleMonitor(session)
+  })
+
   // Registered before the socket exists so no early output is dropped.
   sessions.set(sessionId, session)
   // Claim it for this window. Main routes a session's events to exactly one
@@ -2016,9 +2344,16 @@ async function openSession(rawConn: Connection, externalId?: string): Promise<vo
     if (activeId === sessionId) fit.fit()
   }).observe(termBox)
 
-  const agentBtn = tbtn('AI', 'agent', '用自然语言操作这台机器；只读的自己跑，改动服务器前都会问你', () =>
+  const agentBtn = tbtn('AI', 'agent', '用自然语言操作这台机器；只有会删数据、覆盖文件的命令才停下来问你', () =>
     toggleAgent(session)
   )
+  // Right-click on it goes to the saved conversations; a plain click still
+  // opens the live one, which is where the work happens.
+  agentBtn.addEventListener('contextmenu', (ev) => {
+    ev.preventDefault()
+    ev.stopPropagation()
+    void agentHistoryDialog(session.connectionId)
+  })
 
   toolbar.append(
     tbtn('文件', 'files', 'SFTP 文件面板 (Ctrl+Shift+B)，文件可直接拖入上传', () => void toggleFiles(session)),
@@ -2595,7 +2930,12 @@ function buildFilePanel(session: Session): void {
     btn('⟳', '刷新', () => void navigate(session, session.filePath)),
     btn('🗀 新建', '新建目录', () => void mkdirHere(session)),
     btn('⬆ 上传', '上传文件到当前目录（也可以直接把文件拖进来）', () => void uploadHere(session)),
-    more
+    more,
+    panelClose('关闭文件面板', () => {
+      session.files.classList.remove('open')
+      session.toolbar.querySelector<HTMLElement>('[data-act="files"]')?.classList.remove('on')
+      session.fit.fit()
+    })
   )
 
   const pathbar = el('div', 'pathbar')
@@ -3229,11 +3569,16 @@ function drawSpark(canvas: HTMLCanvasElement, values: number[], max: number): vo
 
 interface MonitorView {
   root: HTMLElement
+  /** The X in the panel header; the session wires it after the view exists. */
+  close: HTMLElement
   alerts: HTMLElement
   cpu: { value: HTMLElement; detail: HTMLElement; spark: HTMLCanvasElement; fill: HTMLElement; hist: number[] }
   mem: { value: HTMLElement; detail: HTMLElement; spark: HTMLCanvasElement; fill: HTMLElement; hist: number[] }
   swap: { value: HTMLElement; detail: HTMLElement; fill: HTMLElement }
-  net: { down: HTMLElement; up: HTMLElement; spark: HTMLCanvasElement; hist: number[] }
+  net: { down: HTMLElement; up: HTMLElement; spark: HTMLCanvasElement; hist: number[]; meta: HTMLElement }
+  netBox: HTMLElement
+  /** One row per interface, kept across polls so its sparkline accumulates. */
+  netRows: Map<string, { name: HTMLElement; spark: HTMLCanvasElement; hist: number[]; rate: HTMLElement; total: HTMLElement }>
   gpu: HTMLElement
   disk: HTMLElement
   info: HTMLElement
@@ -3257,17 +3602,27 @@ function setMeter(fill: HTMLElement, pct: number, tone: Tone): void {
 function buildMonitor(): MonitorView {
   const root = el('div', 'monitor')
 
+  const head = el('div', 'mon-head')
+  head.append(el('span', 'mon-head-title', '资源监控'))
+  const close = panelClose('关闭监控面板', () => {})
+  head.append(close)
+  root.append(head)
+
+  // The header stays put while the readings scroll under it.
+  const body = el('div', 'mon-body')
+  root.append(body)
+
   // "Is anything wrong?" is the first question, so its answer goes on top.
   const alerts = el('div', 'mon-alerts')
-  root.append(alerts)
+  body.append(alerts)
 
   const info = el('div', 'mon-info')
-  root.append(info)
+  body.append(info)
 
   // Two columns keep the four numbers on one screen — a single column needed a
   // scroll just to reach the disks.
   const grid = el('div', 'mon-grid')
-  root.append(grid)
+  body.append(grid)
 
   /**
    * A card = label + big number, then a trend line and/or a level bar. The bar
@@ -3300,26 +3655,41 @@ function buildMonitor(): MonitorView {
   const netG = gauge('网络', 'spark')
   // Rates are longer strings than a percentage, so that one card sets its own size.
   netG.value.classList.add('gauge-rate')
+  // Latency and total traffic share the detail line under the sparkline: two
+  // numbers that answer different halves of "is the network the problem".
+  const netMeta = el('div', 'mon-line')
+  netG.value.parentElement?.append(netMeta)
 
+  // Disks and GPUs first, network last: the network block is the one that
+  // grows a row per interface, so it belongs where the scroll ends.
   const gpuBox = el('div', 'mon-section')
   gpuBox.append(el('div', 'mon-title', 'GPU'))
   const gpu = el('div', 'mon-body')
   gpuBox.append(gpu)
-  root.append(gpuBox)
+  body.append(gpuBox)
 
   const diskBox = el('div', 'mon-section')
   diskBox.append(el('div', 'mon-title', '磁盘'))
   const disk = el('div', 'mon-body')
   diskBox.append(disk)
-  root.append(diskBox)
+  body.append(diskBox)
+
+  const netBox = el('div', 'mon-section')
+  netBox.append(el('div', 'mon-title', '网络'))
+  const netList = el('div', 'mon-body')
+  netBox.append(netList)
+  body.append(netBox)
 
   return {
     root,
+    close,
     alerts,
     cpu: { value: cpuG.value, detail: cpuG.detail, spark: cpuG.spark, fill: cpuG.fill, hist: [] },
     mem: { value: memG.value, detail: memG.detail, spark: memG.spark, fill: memG.fill, hist: [] },
     swap: { value: swapG.value, detail: swapG.detail, fill: swapG.fill },
-    net: { down: netG.value, up: netG.detail, spark: netG.spark, hist: [] },
+    net: { down: netG.value, up: netG.detail, spark: netG.spark, hist: [], meta: netMeta },
+    netBox: netList,
+    netRows: new Map(),
     gpu,
     disk,
     info,
@@ -3371,6 +3741,57 @@ function renderMonitor(view: MonitorView, m: MonitorSnapshot): void {
   view.net.down.textContent = `↓ ${humanRate(m.netDown)}`
   view.net.up.textContent = `↑ ${humanRate(m.netUp)}`
   drawSpark(view.net.spark, view.net.hist, Math.max(1024, ...view.net.hist))
+
+  // Latency is measured from this machine, so it says whether the line is slow
+  // — the sparkline above only says whether the server is moving bytes.
+  const rtt = m.latency?.rtt ?? -1
+  const rttTone = rtt < 0 ? 'danger' : toneOf(rtt, 'latency')
+  const totalDown = m.netTotals.reduce((sum, n) => sum + n.rxBytes, 0)
+  const totalUp = m.netTotals.reduce((sum, n) => sum + n.txBytes, 0)
+  view.net.meta.replaceChildren(
+    el('span', `tone-${rttTone}`, rtt < 0 ? '延迟 —' : `延迟 ${rtt} ms`),
+    el('span', '', `累计 ↓${human(totalDown)} ↑${human(totalUp)}`)
+  )
+
+  // Per interface: a trend line, then the rate and the running total beside it.
+  // Rows are reused by name, so a poll only moves the line instead of
+  // rebuilding the section and losing every history with it.
+  const live = new Set(m.netTotals.map((n) => n.name))
+  for (const name of view.netRows.keys()) {
+    if (live.has(name)) continue
+    view.netRows.get(name)!.name.parentElement?.remove()
+    view.netRows.delete(name)
+  }
+  if (!m.netTotals.length) {
+    view.netBox.replaceChildren(el('div', 'mon-empty', '没有可用的网卡读数'))
+  }
+  for (const n of m.netTotals) {
+    let row = view.netRows.get(n.name)
+    if (!row) {
+      const box = el('div', 'mon-net')
+      const label = el('span', 'mon-name', n.name)
+      const spark = el('canvas', 'net-spark')
+      box.append(label, spark)
+      const rate = el('span', 'mon-val')
+      const total = el('span', 'mon-sub')
+      box.append(rate, total)
+      view.netBox.querySelector('.mon-empty')?.remove()
+      view.netBox.append(box)
+      row = { name: label, spark, hist: [], rate, total }
+      view.netRows.set(n.name, row)
+    }
+    const current = m.net.find((r) => r.name === n.name)
+    const up = current?.rx ?? 0
+    const down = current?.tx ?? 0
+    push(row.hist, up + down)
+    // The scale is the busiest interface seen so far, so one quiet card and one
+    // busy card are not drawn to the same scale and mistaken for each other.
+    const peak = Math.max(1024, ...[...view.netRows.values()].flatMap((r) => r.hist))
+    row.spark.title = `${n.name} · ↓${humanRate(up)} ↑${humanRate(down)}`
+    drawSpark(row.spark, row.hist, peak)
+    row.rate.textContent = `↓${humanRate(up)} ↑${humanRate(down)}`
+    row.total.textContent = `累计 ↓${human(n.rxBytes)} ↑${human(n.txBytes)}`
+  }
 
   const alerts = alertsFor(m)
   view.alerts.dataset.tone = alerts[0]?.tone ?? 'ok'
@@ -3516,9 +3937,15 @@ interface AgentView {
   busy: boolean
   /** The "requesting…" row, while the turn has said nothing yet. */
   working: HTMLElement | null
+  /** Panel header buttons: close this panel, or put the conversation in a window. */
+  close: HTMLElement
+  popout: HTMLElement
+  /** Set in a standalone window, which has no Session to look itself up with. */
+  sessionId?: string
+  connectionId?: string
 }
 
-function buildAgent(): AgentView {
+function buildAgent(standalone = false): AgentView {
   const root = el('div', 'agent')
   // Remembered, not fixed: the same panel holds a one-line answer and a 40-line
   // diff, and only the person reading it knows which one is coming.
@@ -3534,8 +3961,27 @@ function buildAgent(): AgentView {
   head.append(el('span', 'agent-title', 'AI 助手'))
   const wide = el('button', 'agent-mini agent-wide', '⤢')
   wide.title = '占满整行，专看这边的命令和回复（再点一次还原）'
+  const popout = el('button', 'agent-mini', '⧉')
+  popout.title = '在独立窗口中打开 AI 面板'
   const clear = el('button', 'agent-mini', '清空')
-  head.append(wide, clear)
+  const past = el('button', 'agent-mini', '历史')
+  past.title = '查看并导出这台机器的历史对话'
+  const close = panelClose(standalone ? '关闭窗口' : '关闭 AI 面板', () => {})
+  head.append(wide, popout, past, clear, close)
+  if (standalone) {
+    // No terminal to share the row with, nothing to pop out of, and the X
+    // closes the window it is now the whole content of.
+    root.classList.add('agent-standalone')
+    grip.hidden = true
+    wide.hidden = true
+    popout.hidden = true
+    // This window is the panel: its X closes the window.
+    close.addEventListener('click', () => void api.closeWindow())
+  }
+  past.addEventListener('click', () => {
+    const cell = [...sessions.values()].find((s) => s.agent === view)
+    void agentHistoryDialog(cell?.connectionId ?? view.connectionId ?? '')
+  })
   root.append(head)
 
   const log = el('div', 'agent-log')
@@ -3554,7 +4000,7 @@ function buildAgent(): AgentView {
     el(
       'div',
       'agent-setup-note',
-      '设置里填「接口地址」和「模型」就行 —— 模型名可以从接口拉取，本地网关不用 API Key。配好之后：只读的自己跑，改动服务器的会先问过你。'
+      '设置里填「接口地址」和「模型」就行 —— 模型名可以从接口拉取，本地网关不用 API Key。配好之后：只读的直接跑，可逆的改动也直接跑，只有会丢数据的命令才停下来问你。'
     ),
     setupBtn
   )
@@ -3601,15 +4047,15 @@ function buildAgent(): AgentView {
     live: null,
     open: null,
     busy: false,
-    working: null
+    working: null,
+    close,
+    popout
   }
   clear.addEventListener('click', () => {
     const session = [...sessions.values()].find((s) => s.agent === view)
-    if (session) void api.agentReset(session.id)
-    log.replaceChildren(agentHint())
-    view.live = null
-    view.open = null
-    setAgentBusy(view, false)
+    const id = session?.id ?? view.sessionId
+    if (id) void api.agentReset(id)
+    clearAgentView(view)
   })
   setAgentBusy(view, false)
   return view
@@ -3618,6 +4064,19 @@ function buildAgent(): AgentView {
 function wireAgent(session: Session): void {
   const view = session.agent
   if (!view) return
+
+  if (!view.root.classList.contains('agent-standalone')) {
+    view.close.addEventListener('click', () => {
+      if (view.root.style.display !== 'none') toggleAgent(session)
+    })
+    view.popout.addEventListener('click', () => {
+      void api.popOutAgent(session.id, session.connectionId).then((opened) => {
+        // One conversation, one place to type in it: the window takes over and
+        // the side panel folds away. The AI button still opens it again.
+        if (opened && view.root.style.display !== 'none') toggleAgent(session)
+      })
+    })
+  }
 
   // One click when the terminal is in the way — an approval card and a 40-line
   // reply are read on this side, and dragging the divider every time is the
@@ -3663,9 +4122,9 @@ function wireAgent(session: Session): void {
     view.input.style.height = ''
     view.files = []
     renderAgentFiles(view)
-    // Shown straight away rather than echoed back from the main process — the
-    // round trip is long enough to feel broken otherwise.
-    addAgentRow(view, 'user', files.length ? `${said}\n📎 ${files.map(baseName).join('、')}` : said)
+    // The row on screen is not drawn here: main echoes the turn back as a
+    // `user` event, so a second window on this conversation and the saved
+    // transcript both get it from the same place.
     setAgentBusy(view, true)
     // A rejected invoke is the one failure with no event behind it — without
     // this the panel would sit on "正在请求…" forever with no way to tell.
@@ -3760,8 +4219,17 @@ function agentHint(): HTMLElement {
   return el(
     'div',
     'agent-hint',
-    '让它在这台机器上做点什么，比如「磁盘还剩多少」。只读的自己跑；要改动服务器的会先问你，确认后就打在左边那个终端里执行。'
+    '让它在这台机器上做点什么，比如「磁盘还剩多少」。命令打在左边那个终端里执行；只有会删数据、覆盖文件的才会先问你一下。'
   )
+}
+
+/** Back to the first-run state. Main broadcasts this so every window showing
+ *  the conversation empties together — the transcript lives in one process. */
+function clearAgentView(view: AgentView): void {
+  view.log.replaceChildren(agentHint())
+  view.live = null
+  view.open = null
+  setAgentBusy(view, false)
 }
 
 function addAgentRow(view: AgentView, cls: string, text: string): HTMLElement {
@@ -3772,29 +4240,51 @@ function addAgentRow(view: AgentView, cls: string, text: string): HTMLElement {
   return row
 }
 
+/** The settled answer: swap the streamed plain text for rendered Markdown. */
+function settleAssistant(row: HTMLElement, text: string): void {
+  row.classList.remove('streaming')
+  row.classList.add('md')
+  row.replaceChildren(renderMarkdown(text))
+}
+
 function renderAgent(session: Session, ev: AgentEvent): void {
   const view = session.agent
   if (!view) return
   const stick = view.log.scrollHeight - view.log.scrollTop - view.log.clientHeight < 40
 
   // The first thing that actually happens retires the "requesting" row: the
-  // turn is no longer silent, whatever it turned out to say.
-  if (view.working && ev.kind !== 'done') {
+  // turn is no longer silent, whatever it turned out to say. The echo of the
+  // user's own turn is not "something happening" — it is what it is waiting on.
+  if (view.working && ev.kind !== 'done' && ev.kind !== 'user') {
     view.working.remove()
     view.working = null
   }
 
   switch (ev.kind) {
+    case 'user':
+      // Echoed by main, so it lands in every window open on this conversation
+      // and in the stored transcript with the same wording.
+      addAgentRow(
+        view,
+        'user',
+        ev.files?.length ? `${ev.text}\n📎 ${ev.files.map(baseName).join('、')}` : ev.text
+      )
+      // It was appended before the message it is waiting on; the waiting row
+      // belongs at the bottom of the transcript, not above the question.
+      if (view.working) view.log.append(view.working)
+      break
     case 'delta': {
-      if (!view.live) view.live = addAgentRow(view, 'assistant', '')
+      if (!view.live) view.live = addAgentRow(view, 'assistant streaming', '')
+      // Plain text while it types: re-parsing half a fence on every token
+      // makes the box jump. It is rendered once the answer is complete.
       view.live.textContent += ev.text
       break
     }
     case 'assistant': {
       // Everything already arrived as deltas; this is the settled value, and
-      // setting it is idempotent for the normal case.
+      // rendering it is idempotent for the normal case.
       if (!view.live) view.live = addAgentRow(view, 'assistant', '')
-      view.live.textContent = ev.text
+      settleAssistant(view.live, ev.text)
       view.live = null
       break
     }
@@ -3817,6 +4307,9 @@ function renderAgent(session: Session, ev: AgentEvent): void {
       // button, a dropped connection, or an error.
       if (view.open) closeAgentAsk(view.open.card, '已取消')
       view.open = null
+      // A stopped answer never gets its `assistant` event, so settle whatever
+      // had streamed: the caret should stop blinking even on half a reply.
+      if (view.live) settleAssistant(view.live, view.live.textContent ?? '')
       view.live = null
       setAgentBusy(view, false)
       break
@@ -3829,7 +4322,9 @@ function renderAgent(session: Session, ev: AgentEvent): void {
  *  the decision possible in the two seconds a person will actually spend. */
 function addAgentAsk(view: AgentView, ev: Extract<AgentEvent, { kind: 'ask' }>): void {
   const card = el('div', `agent-ask risk-${ev.risk}`)
-  card.append(el('div', 'agent-ask-why', `${ev.name} 需要你确认 — ${ev.why}`))
+  // Only no-undo commands get here now, so the card is the one place that has
+  // to be read; the wording says what is about to be lost, not that it is a step.
+  card.append(el('div', 'agent-ask-why', `${ev.name} 会删改数据 — ${ev.why}`))
 
   // Editable only for shell commands: that is the only place a person knows
   // better than the model. Editing it re-runs the risk check.
@@ -3881,6 +4376,98 @@ function syncAgentEntry(session: Session): void {
   // The transcript stays in the DOM either way: the conversation in the main
   // process outlives the key being edited.
   session.agent.log.hidden = !ready
+}
+
+/* ------------------------------------------------------------------ *
+ * saved conversations
+ * ------------------------------------------------------------------ */
+
+/** The list for one connection, newest first. A lid on the count, not a
+ *  pager: past a few dozen, the export is the better way to read them. */
+async function agentHistoryDialog(connectionId: string): Promise<void> {
+  if (!connectionId) return
+  const items = await api.agentHistory(connectionId)
+  const list = el('div', 'hist-list')
+
+  if (!items.length) {
+    list.append(el('div', 'mon-empty', '这台机器还没有存下来的对话。'))
+  }
+  for (const item of items) {
+    const row = el('button', 'hist-item')
+    row.append(el('span', 'hist-title', item.title || '未命名对话'))
+    row.append(el('span', 'hist-when', when(item.updatedAt)))
+    row.addEventListener('click', () => void agentHistoryView(item.id))
+    list.append(row)
+  }
+
+  showModal('AI 历史对话', list, [{ label: '关闭', primary: true, onClick: closeModal }])
+}
+
+function when(ms: number): string {
+  const d = new Date(ms)
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+/** One saved conversation, read-only: the approval cards are a record of what
+ *  was asked, not buttons that would send something a session no longer backs. */
+async function agentHistoryView(id: string): Promise<void> {
+  const convo = await api.agentHistoryGet(id)
+  if (!convo) return
+  const view = el('div', 'agent-log history-view')
+  for (const ev of convo.events) view.append(...archiveRow(ev))
+  if (!view.childElementCount) view.append(el('div', 'mon-empty', '这段对话没有内容。'))
+
+  const body = el('div', 'hist-body')
+  body.append(view)
+  showModal(convo.title || 'AI 历史对话', body, [
+    { label: '返回', onClick: () => void agentHistoryDialog(convo.connectionId) },
+    {
+      label: '删除',
+      danger: true,
+      onClick: async () => {
+        await api.agentHistoryDelete(convo.id)
+        await agentHistoryDialog(convo.connectionId)
+      }
+    },
+    {
+      label: '导出',
+      primary: true,
+      onClick: async () => {
+        const path = await api.agentHistoryExport(convo.id)
+        if (path) log('info', `AI 对话已导出 → ${path}`)
+        closeModal()
+      }
+    }
+  ])
+}
+
+function archiveRow(ev: AgentEvent): HTMLElement[] {
+  switch (ev.kind) {
+    case 'user':
+      return [el('div', 'agent-msg user', ev.files?.length ? `${ev.text}\n📎 ${ev.files.map(baseName).join('、')}` : ev.text)]
+    case 'assistant': {
+      const row = el('div', 'agent-msg assistant md')
+      row.append(renderMarkdown(ev.text))
+      return [row]
+    }
+    case 'tool':
+      return [el('div', 'agent-msg tool', `▶ ${ev.detail}`)]
+    case 'result':
+      return [el('div', `agent-msg result${ev.ok ? '' : ' bad'}`, ev.summary || '（无输出）')]
+    case 'ask': {
+      const card = el('div', `agent-ask risk-${ev.risk} answered`)
+      card.append(el('div', 'agent-ask-why', `${ev.name} — ${ev.why}`))
+      const cmd = el('pre', 'agent-ask-cmd', ev.detail)
+      cmd.setAttribute('readonly', '')
+      card.append(cmd)
+      return [card]
+    }
+    case 'error':
+      return [el('div', 'agent-msg error', ev.message)]
+    default:
+      return []
+  }
 }
 
 function toggleAgent(session: Session): void {
@@ -4036,6 +4623,10 @@ function appKey(ev: KeyboardEvent): boolean {
       if (ev.shiftKey) return false
       connDialog(null, null)
       return true
+    case 'KeyB':
+      if (ev.shiftKey) return false
+      toggleSidebar()
+      return true
     case 'Comma':
       settingsDialog()
       return true
@@ -4052,6 +4643,7 @@ function appKey(ev: KeyboardEvent): boolean {
 
 const SHORTCUTS: [string, string][] = [
   ['Ctrl + T', '新建连接'],
+  ['Ctrl + B', '收起 / 展开连接列表'],
   ['⌘ / 🔑', '命令面板 / 私钥管理'],
   ['Ctrl + ,', '设置'],
   ['Ctrl + /', '快捷键一览'],
@@ -4069,7 +4661,7 @@ const SHORTCUTS: [string, string][] = [
   ['Alt + ↑ / ↓', '文件面板：上一级 / 进入选中目录'],
   ['↓', '命令候选：进入面板，依次往下选'],
   ['↑', '命令候选：往回退到已输入的内容'],
-  ['右键', '会话内菜单；终端内粘贴']
+  ['右键', '会话内菜单（终端里不再粘贴，用 Ctrl+Shift+V）']
 ]
 
 /** Handled by the remote shell, not by us — here because nobody remembers them. */
@@ -4109,7 +4701,28 @@ function shortcutsDialog(): void {
   showModal('快捷键', body, [{ label: '关闭', primary: true, onClick: closeModal }])
 }
 
+/** The connection list comes and goes from the titlebar; a narrow screen is
+ *  where this actually gets used, so it is remembered like the panel width. */
+function toggleSidebar(): void {
+  // One value, read before anything changes it: applySidebar writes it back
+  // into the settings object, so re-reading it below would save the old one.
+  const collapsed = !store.settings.sidebarCollapsed
+  applySidebar(collapsed)
+  void api
+    .saveSettings({ ...store.settings, sidebarCollapsed: collapsed })
+    .then((next) => (store.settings = next))
+}
+
+function applySidebar(collapsed: boolean): void {
+  store.settings.sidebarCollapsed = collapsed
+  document.body.classList.toggle('side-off', collapsed)
+  sessions.get(activeId ?? '')?.fit.fit()
+}
+
+/** Right-clicking the sidebar's empty space adds something there. */
+
 function wireChrome(): void {
+  $('#btn-side').addEventListener('click', toggleSidebar)
   $('#btn-new-conn').addEventListener('click', () => connDialog(null, null))
   $('#btn-new-folder').addEventListener('click', () => folderDialog(null, null))
   $('#btn-import').addEventListener('click', (ev) => transferMenu(ev))
@@ -4128,6 +4741,28 @@ function wireChrome(): void {
 
   const sidebar = $('#sidebar')
   const resizer = $('#resizer')
+  applySidebar(store.settings.sidebarCollapsed)
+  // Right-clicking the empty part of the list is the natural place for "put one
+  // here"; a node's own menu stops the click before it gets here.
+  const treeEl = $('#tree')
+  treeEl.addEventListener('contextmenu', (ev) => {
+    if ((ev.target as HTMLElement).closest('.node')) return
+    ev.preventDefault()
+    emptyTreeMenu(ev)
+  })
+  // Dropping on the blank space moves to the root — the way back out of a
+  // folder once something has been dragged into it.
+  treeEl.addEventListener('dragover', (ev) => {
+    if (!dragId || (ev.target as HTMLElement).closest('.node')) return
+    ev.preventDefault()
+  })
+  treeEl.addEventListener('drop', (ev) => {
+    if (!dragId || (ev.target as HTMLElement).closest('.node')) return
+    ev.preventDefault()
+    const id = dragId
+    dragId = null
+    void moveInto(id, null)
+  })
   resizer.addEventListener('mousedown', (down: MouseEvent) => {
     down.preventDefault()
     const startX = down.clientX
@@ -4155,16 +4790,10 @@ function wireChrome(): void {
     }
   })
 
-  // Right-click paste, matching the muscle memory of most terminal clients.
-  document.addEventListener('contextmenu', (ev) => {
-    const inTerm = (ev.target as HTMLElement).closest('.term-box')
-    if (!inTerm || !store.settings.rightClickPaste) return
-    ev.preventDefault()
-    void navigator.clipboard.readText().then((text) => {
-      const session = activeId ? sessions.get(activeId) : undefined
-      if (text && session) send(session, text)
-    })
-  })
+  // Right-click in the terminal used to paste. It now does what it does
+  // everywhere else in the app — opens the pane menu (see buildTab) — because
+  // a stray right click that dumps the clipboard into a live shell is exactly
+  // the accident this was.
 }
 
 void boot()

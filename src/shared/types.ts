@@ -14,6 +14,22 @@ export interface Connection {
   folderId: string | null
   host: string
   port: number
+  /**
+   * Local address the outbound socket binds to. The escape hatch for two VPNs
+   * whose routes cover the same remote subnet: the OS picks one route for a
+   * destination, but binding to a tunnel's own address sends the connection
+   * down that tunnel. Empty means let the OS choose.
+   */
+  localAddress?: string
+  /**
+   * Bind to whichever address this interface has right now. Preferred over
+   * `localAddress` for VPN tunnels: reconnecting a VPN hands out a new address,
+   * and a pinned one silently stops matching anything.
+   */
+  localIface?: string
+  /** The name `ssh <alias>` uses, assigned the first time passwordless login is
+   *  configured. Kept so a second profile on the same IP does not steal it. */
+  sshAlias?: string
   username: string
   authType: AuthType
   /** Encrypted-at-rest secret (password or key passphrase). Never plaintext on disk. */
@@ -82,7 +98,8 @@ export interface Settings {
   cursorBlink: boolean
   scrollback: number
   copyOnSelect: boolean
-  rightClickPaste: boolean
+  /** The connection list folded away to a strip, for a narrow screen. */
+  sidebarCollapsed: boolean
   /** Pixels the AI panel takes from the terminal. Dragged, so it is a view
    *  preference like the font — not something to re-decide every launch. */
   agentWidth: number
@@ -93,6 +110,13 @@ export interface HostKeyRecord {
   host: string
   port: number
   fingerprint: string
+  /**
+   * Connection profile this key is pinned to. Identity is the profile, not the
+   * address: two environments (a test and a prod cluster, say) can hand out the
+   * same IP. Records written before pinning was per connection have no
+   * `connId`; a connection adopts one only when it names the exact same key.
+   */
+  connId?: string
 }
 
 export interface Store {
@@ -131,6 +155,21 @@ export interface NetIface {
   tx: number
 }
 
+/** Cumulative counters for one interface, from /proc/net/dev. */
+export interface NetCounter {
+  name: string
+  rxBytes: number
+  txBytes: number
+}
+
+/** The ssh transport's own view of the link: the time a TCP round trip takes
+ *  to the server. Independent of the box, and the number that answers "is the
+ *  line slow or is the machine busy". */
+export interface NetLatency {
+  /** Round-trip milliseconds, or -1 when the probe could not connect. */
+  rtt: number
+}
+
 export interface GpuInfo {
   name: string
   util: number
@@ -160,6 +199,10 @@ export interface MonitorSnapshot {
   netDown: number
   netUp: number
   net: { name: string; rx: number; tx: number }[]
+  /** Totals since boot, for the traffic figure — the rates alone reset on reboot. */
+  netTotals: NetCounter[]
+  /** Measured from this machine to the server, not on it. */
+  latency?: NetLatency
   disk: DiskInfo[]
   gpu: GpuInfo[]
   uptime: number
@@ -251,6 +294,9 @@ export interface BackupBundle {
    *  does not re-confirm every server. Trust travels with the file — which is
    *  also why the file has to be treated like the keys inside it. */
   knownHosts?: HostKeyRecord[]
+  /** AI conversations for the connections in this file. Carried so a machine
+   *  that takes over a server also gets what was already asked about it. */
+  agentHistory?: AgentConversation[]
   secrets?: SealedSecrets
 }
 
@@ -313,8 +359,25 @@ export interface SessionInfo {
   error?: string
 }
 
+/** The installer for this machine, as the release publishes it. */
+export interface UpdateAsset {
+  name: string
+  url: string
+  size: number
+  /** URL of the `.sha256` the release carries beside the installer, if any. */
+  sha256?: string
+}
+
+export type UpdateCheck =
+  | { kind: 'latest'; current: string; latest: string }
+  | { kind: 'available'; current: string; latest: string; notes: string; asset: UpdateAsset | null }
+  | { kind: 'error'; message: string }
+
 /** Outcome of configuring plain `ssh <host>` on this machine. */
 export interface PasswordlessResult {
+  /** `ssh <alias>` — unique per connection, since two profiles can share an
+   *  address and must not overwrite each other's config block. */
+  alias: string
   host: string
   port: number
   username: string
@@ -403,6 +466,12 @@ export interface Api {
   agentAbort(sessionId: string): Promise<void>
   /** Drops the conversation but keeps the panel. */
   agentReset(sessionId: string): Promise<void>
+  /** Conversations saved for one connection, newest first. */
+  agentHistory(connectionId: string): Promise<AgentConversationInfo[]>
+  agentHistoryGet(id: string): Promise<AgentConversation | null>
+  agentHistoryDelete(id: string): Promise<void>
+  /** Writes one conversation to a file the user picks; returns the path. */
+  agentHistoryExport(id: string): Promise<string | null>
 
   /** Model ids the endpoint reports, for the settings picker. `apiKey` is used
    *  only if given here — otherwise the saved one. Throws with the URL it
@@ -411,6 +480,19 @@ export interface Api {
 
   /** Repaints the OS window buttons so they match the active theme. */
   setWindowChrome(background: string, foreground: string): Promise<void>
+
+  /** Asks GitHub for the latest published release. Never throws — a failure
+   *  comes back as `{ kind: 'error' }` so the dialog can say what happened. */
+  updateCheck(): Promise<UpdateCheck>
+  /** Downloads the installer and reports progress. Resolves to its path. */
+  updateDownload(): Promise<string>
+  /** Runs the downloaded installer (or opens it, on macOS/Linux). */
+  updateInstall(path: string): Promise<void>
+  onUpdateProgress(cb: (received: number, total: number) => void): () => void
+  /** Opens the release page in the user's browser. */
+  updateReleasesUrl(): Promise<void>
+  /** This build's version, as package.json says. */
+  appVersion(): Promise<string>
 
   /** Absolute path of a dropped File; Electron keeps it out of the DOM. */
   pathForFile(file: File): string
@@ -432,6 +514,8 @@ export interface Api {
   /** Installs LiteShell's local key on the server and writes the ssh config
    *  block, so `ssh <host>` works here without a password afterwards. */
   setupPasswordless(id: string, secret?: string): Promise<PasswordlessResult>
+  /** Local IPv4 addresses by interface, for the "bind to this tunnel" picker. */
+  netInterfaces(): Promise<{ name: string; address: string }[]>
   /** `path` is only for the second call, after a `needsPassphrase` answer. */
   importConnections(
     passphrase?: string,
@@ -446,6 +530,18 @@ export interface Api {
   /** Moves a live tab into its own window. The caller must drop its tab after
    *  this resolves — events for the session go to the new window from here on. */
   popOutSession(sessionId: string, connectionId: string): Promise<boolean>
+  /** Opens the conversation in its own window. The panel stays where it is;
+   *  agent events are mirrored to both. */
+  popOutAgent(sessionId: string, connectionId: string): Promise<boolean>
+  /** Registers this window for a session's agent events and returns the
+   *  transcript so far, so the new window starts filled in. */
+  attachAgentWindow(sessionId: string): Promise<AgentEvent[]>
+  /** Fired when the conversation is cleared anywhere, so every window showing
+   *  it empties together. */
+  onAgentCleared(cb: (sessionId: string) => void): () => void
+  /** Closes the window this renderer lives in. Used by windows that are just
+   *  a panel, where the header's X means "this window", not "hide the panel". */
+  closeWindow(): Promise<void>
 
   onSessionEvent(cb: (ev: SessionEvent) => void): () => void
 }
@@ -456,6 +552,9 @@ export interface Api {
  * place a command can be stopped.
  */
 export type AgentEvent =
+  /** What the user sent. Emitted by main so every window — and the stored
+   *  transcript — has the same record of the turn. */
+  | { kind: 'user'; text: string; files?: string[] }
   /** Text streaming out of the model, appended to the message already shown. */
   | { kind: 'delta'; text: string }
   | { kind: 'assistant'; text: string }
@@ -468,6 +567,22 @@ export type AgentEvent =
   | { kind: 'ask'; askId: string; name: string; detail: string; risk: string; why: string }
   | { kind: 'error'; message: string }
   | { kind: 'done' }
+
+/** One saved conversation. Deltas are not kept: every answer also arrives once,
+ *  whole, so a stored transcript is the settled events only. */
+export interface AgentConversation {
+  id: string
+  connectionId: string
+  /** The first thing the user said, trimmed — a list of untitled entries is
+   *  the same as no list. */
+  title: string
+  createdAt: number
+  updatedAt: number
+  events: AgentEvent[]
+}
+
+/** Identity only, for the history list. */
+export type AgentConversationInfo = Omit<AgentConversation, 'events'>
 
 export type SessionEvent =
   /** Main opened this one on its own (the CLI asked for it); the renderer's job is

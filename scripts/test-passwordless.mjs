@@ -1,7 +1,7 @@
 /**
- * Unit check for the strings behind "one-click passwordless ssh": the
- * authorized_keys install command and the ~/.ssh/config merge. Neither touches
- * the filesystem, so this runs anywhere.
+ * Unit check for the authorized_keys install command — the half of "one-click
+ * passwordless ssh" that is a shell string. The ~/.ssh/config merge has its
+ * own file (test-sshconfig.mjs).
  *
  *   node scripts/test-passwordless.mjs
  */
@@ -43,30 +43,6 @@ check(
   '公钥里的单引号被正确转义',
   installCommand("ssh-ed25519 AAA'BBB").includes(`'ssh-ed25519 AAA'\\''BBB'`)
 )
-
-/* ---------------- ssh config ---------------- */
-
-const host = { host: '10.157.150.22', port: 22, username: 'root' }
-const block = sshConfigWith('', host)
-check('生成 Host 块', block.includes('Host 10.157.150.22') && block.includes('User root'))
-check('22 端口不写 Port', !block.includes('Port 22'))
-check('指向生成的私钥', block.includes('IdentityFile ~/.ssh/liteshell_ed25519'))
-check('限定只用这把钥匙', block.includes('IdentitiesOnly yes'))
-
-const userConfig = 'Host github.com\n    User git\n'
-const merged = sshConfigWith(userConfig, host)
-check('用户原有配置原样保留', merged.includes(userConfig))
-check('LiteShell 块排在最前面', merged.startsWith('# >>> LiteShell: 10.157.150.22 >>>'))
-
-check('重复执行结果不变', sshConfigWith(merged, host) === merged)
-
-const changed = sshConfigWith(merged, { ...host, port: 2222, username: 'deploy' })
-check('同主机重配会替换旧块而不是堆叠', (changed.match(/# >>> LiteShell:/g) ?? []).length === 1)
-check('非 22 端口写进 Port', changed.includes('Port 2222') && changed.includes('User deploy'))
-check('替换后用户配置还在', changed.includes(userConfig))
-
-const another = sshConfigWith(changed, { host: '10.0.0.9', port: 22, username: 'ops' })
-check('配另一台机器时保留已有块', another.includes('Host 10.157.150.22') && another.includes('Host 10.0.0.9'))
 
 rmSync(work, { recursive: true, force: true })
 console.log(failures ? `\n${failures} 项失败` : '\n全部通过')

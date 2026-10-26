@@ -18,73 +18,6 @@
  */
 const READ_TOOLS = new Set(['read_output', 'monitor', 'ls', 'cat'])
 
-/**
- * `exec` with a command that only prints, so the model stops spending a prompt
- * on `tail -n 50 app.log`.
- *
- * A whitelist, not "anything that does not look dangerous". The two differ
- * exactly on the command nobody thought of: `systemctl start nginx`,
- * `python -c '…'` and `find . -delete` all read as harmless to a pattern list,
- * and every one of them changes the machine. Here the unknown answer is a
- * prompt, so a gap in the list costs a click, not a server.
- *
- * The shape rule is what makes the list trustworthy: one process, no shell
- * syntax at all. No `|`, `;`, `&&`, redirection, `$(…)` or backticks — those are
- * how a reader becomes a writer, and there is no second half of the line left
- * unread.
- */
-const READ_VERBS = new Set([
-  'ls', 'cat', 'head', 'tail', 'grep', 'egrep', 'fgrep', 'rg', 'wc', 'cut', 'sort', 'uniq', 'tr',
-  'df', 'du', 'free', 'ps', 'pgrep', 'pidof', 'uptime', 'uname', 'whoami', 'id', 'nproc', 'lscpu',
-  'lsmod', 'lsblk', 'stat', 'file', 'readlink', 'realpath', 'basename', 'dirname', 'readelf',
-  'md5sum', 'sha1sum', 'sha256sum', 'cksum', 'env', 'printenv', 'echo', 'printf', 'pwd', 'which',
-  'type', 'tree', 'lsof', 'ss', 'netstat', 'vmstat', 'iostat', 'mpstat', 'sar', 'dmesg',
-  'journalctl', 'nvidia-smi', 'who', 'w', 'last', 'lastlog', 'tty', 'getent', 'dig', 'nslookup',
-  'host', 'ping', 'traceroute', 'find'
-])
-
-/** Sub-commands that only print, where the verb alone is not the reader:
- *  `systemctl status` is, `systemctl start` is not. Anchored patterns so each
- *  one names its own boundary — nothing gets in on a prefix of a prefix. */
-const READ_SUBCOMMANDS: RegExp[] = [
-  /^systemctl (status|show|cat|is-|list-)\b/,
-  /^docker (ps|logs|inspect|images|stats|top|version|info|port)\b/,
-  /^git (status|log|diff|show|blame|describe|rev-parse|ls-files)\b/,
-  /^git (stash list|remote -v)\b/,
-  /^kubectl (get|describe|logs|top|explain)\b/,
-  /^crontab -l\b/,
-  /^dpkg (-l|-s)\b/,
-  /^rpm -q\b/,
-  /^(apt|apt-get) list\b/,
-  /^apt-cache\b/,
-  /^(yum|dnf) list\b/,
-  /^apk info\b/,
-  /^pacman -Q\b/,
-  /^(pip|pip3|npm) (list|ls|show|view)\b/,
-  /^yarn list\b/
-]
-
-/** Whole commands that only print, and where any argument at all turns them
- *  into a write: `ip addr` lists the interfaces, `ip addr add …` adds one. */
-const READ_EXACT = new Set(['ip a', 'ip addr', 'ip route', 'ip neigh', 'ip link'])
-
-/** One process, nothing attached to it. Quotes and globs are fine; these are
- *  the shapes that mean "there is more to this line". */
-const SHELL_SYNTAX = /[;&|<>`$(){}]|\\|\n/
-
-/** Flags that turn a reader into a writer on commands that are otherwise only
- *  ever read from. */
-const NOT_READ = /--vacuum|--rotate|-(?:delete|exec|execdir|fprint|fprint0|fls|ok|okdir)(?![\w-])/
-
-/** True when the command is one process that only prints. */
-export function readOnly(command: string): boolean {
-  const c = command.trim()
-  if (!c || SHELL_SYNTAX.test(c) || NOT_READ.test(c)) return false
-  if (READ_EXACT.has(c)) return true
-  if (READ_SUBCOMMANDS.some((r) => r.test(c))) return true
-  return READ_VERBS.has(c.split(/\s+/)[0])
-}
-
 export type Risk = 'safe' | 'risky' | 'critical'
 
 /**
@@ -164,18 +97,62 @@ export interface Verdict {
   why: string
 }
 
-export function gate(tool: string, command = ''): Verdict {
-  if (READ_TOOLS.has(tool)) return { auto: true, risk: 'safe', why: '只读' }
-  if (tool === 'exec') {
-    const risk = riskOf(command)
-    if (risk === 'safe' && readOnly(command)) return { auto: true, risk: 'safe', why: '只读命令' }
-    return { auto: false, risk, why: WHY[risk] }
-  }
-  return { auto: false, risk: 'risky', why: WHY.risky }
+/**
+ * What actually waits for a person: no-undo on the data side.
+ *
+ * The rule is "can this lose something", not "does this write". Restarting a
+ * service, chmod-ing a file, installing a package and `git push` are all
+ * recoverable or reversible, and making people click through them is what
+ * trains them to click through the one that is neither — the measured effect
+ * is a collapse in noticing, not an increase in safety. Anything that deletes,
+ * overwrites or converts storage stays a prompt.
+ *
+ * `sudo`, `$(…)`, pipes and redirections are not on this list on purpose: they
+ * *amplify* a command, and the amplified command is judged on its own text.
+ */
+const DESTRUCTIVE: RegExp[] = [
+  /\brm\b/,
+  /\brmdir\b/,
+  /\bunlink\b/,
+  /\bshred\b/,
+  /\btruncate\b/,
+  /\bmv\b/,
+  /\bdd\b/,
+  /\b(kill|killall|pkill)\b/,
+  /\bdocker\s+(rm|rmi|prune|down|compose\s+down|volume\s+rm|system\s+prune)/,
+  /\bkubectl\s+(delete|drain|cordon)/,
+  /\bgit\s+(reset\s+--hard|clean|push\s+--force|push\s+-f)/,
+  /\b(apt|apt-get|yum|dnf|apk|pacman)\s+\S*(remove|purge|erase|autoremove)/,
+  /\bpip\w*\s+uninstall/,
+  /\b(npm|pnpm|yarn)\s+uninstall/,
+  /\b(vgremove|lvremove|pvremove|swapoff)\b/,
+  /\b(crontab|at)\s+-(r|d)\b/,
+  />>?\s*(?!\/dev\/null\b)[^\s&|]/, // 2>/dev/null is not evidence of anything
+  /\btee\b/
+]
+
+export interface Verdict {
+  /** True = run it now. False = park the loop on a prompt. */
+  auto: boolean
+  risk: Risk
+  /** Plain-language reason, shown on the card and in the transcript. */
+  why: string
 }
 
-const WHY: Record<Risk, string> = {
-  safe: '会改动服务器',
-  risky: '会改动服务器，且有删除/覆盖/提权的痕迹',
+export function gate(tool: string, command = ''): Verdict {
+  if (READ_TOOLS.has(tool)) return { auto: true, risk: 'safe', why: '只读' }
+  // An empty command is a model mistake, not a safe one: it is shown as a card
+  // so the person sees that nothing was proposed.
+  if (!command.trim()) return { auto: false, risk: 'safe', why: '空命令' }
+  const risk = riskOf(command)
+  if (risk === 'critical') return { auto: false, risk, why: WHY.critical }
+  if (DESTRUCTIVE.some((r) => r.test(command))) return { auto: false, risk, why: WHY.data }
+  return { auto: true, risk, why: risk === 'safe' ? WHY.safe : WHY.changes }
+}
+
+const WHY: Record<'safe' | 'changes' | 'data' | 'critical', string> = {
+  safe: '只读命令',
+  changes: '改了服务器，但可以改回来',
+  data: '会删除或覆盖数据，这一步退不回来',
   critical: '命中高危模式：这类命令没有撤销'
 }

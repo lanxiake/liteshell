@@ -49,12 +49,30 @@ await build({
   alias: { electron: stub }
 })
 
+/** The saved conversations live beside the store, in their own module. */
+const historyPath = join(work, 'agenthistory.mjs')
+await build({
+  entryPoints: ['src/main/agenthistory.ts'],
+  bundle: true,
+  format: 'esm',
+  platform: 'node',
+  outfile: historyPath,
+  logLevel: 'silent',
+  alias: { electron: stub }
+})
+
 /** A fresh import of the module, pointed at one user-data dir. Electron creates
  *  that dir on a real machine; here the test has to. */
 async function machine(dir) {
   mkdirSync(dir, { recursive: true })
   process.env.LITESHELL_HOME = dir
   return import(`file://${bundlePath.replaceAll('\\', '/')}?${Math.random()}`)
+}
+
+async function historyFor(dir) {
+  mkdirSync(dir, { recursive: true })
+  process.env.LITESHELL_HOME = dir
+  return import(`file://${historyPath.replaceAll('\\', '/')}?${Math.random()}`)
 }
 
 const src = await machine(srcDir)
@@ -92,8 +110,19 @@ src.setSettings({
   agentWidth: 720,
   llm: { provider: 'openai', baseUrl: 'http://gw:8000/v1', model: 'gw-model', apiKey: 'sk-secret' }
 })
-src.rememberHostKey('10.0.0.1', 22, 'SHA256:aaa')
-src.rememberHostKey('10.0.0.9', 2222, 'SHA256:bbb')
+src.rememberHostKey({ host: '10.0.0.1', port: 22 }, 'SHA256:aaa')
+src.rememberHostKey({ host: '10.0.0.9', port: 2222 }, 'SHA256:bbb')
+
+/* A saved conversation on c1 and one on a machine outside every scope used
+   below, so the export tests can tell "follows the connection" from "went along". */
+const srcHistory = await historyFor(srcDir)
+const convo = srcHistory.append(null, 'c1', { kind: 'user', text: '磁盘满了没' })
+srcHistory.append(convo, 'c1', { kind: 'assistant', text: '还有 12% 空间。' })
+srcHistory.append(null, 'c2', { kind: 'user', text: '看看部署目录' })
+// A conversation whose connection no longer exists: it stays behind, because
+// there is nothing in the file for it to belong to.
+srcHistory.append(null, 'loose', { kind: 'user', text: '另一台机器' })
+srcHistory.flush()
 
 const sealed = src.exportBundle('口令 abc')
 check('导出时报了带走的密码数（1 条连接 + 1 个 API Key）', sealed.passwords === 2, String(sealed.passwords))
@@ -138,7 +167,7 @@ check('界面设置落地了：主题、字号、面板宽度',
   dst.store().settings.theme === 'gruvbox' && dst.store().settings.fontSize === 18 && dst.store().settings.agentWidth === 720,
   JSON.stringify([dst.store().settings.theme, dst.store().settings.fontSize, dst.store().settings.agentWidth]))
 check('主机指纹跟着来，对面不会再问一遍',
-  dst.hostKey('10.0.0.1', 22) === 'SHA256:aaa' && dst.hostKey('10.0.0.9', 2222) === 'SHA256:bbb',
+  dst.legacyHostKey('10.0.0.1', 22) === 'SHA256:aaa' && dst.legacyHostKey('10.0.0.9', 2222) === 'SHA256:bbb',
   JSON.stringify(dst.store().knownHosts))
 
 // The other direction: no passphrase, no passwords on the other side.
@@ -166,6 +195,24 @@ check('对面导入后只有这一条，且密码可用',
   oneDst.publicStore().connections.length === 1 &&
     oneDst.publicStore().connections[0].id === 'c1' &&
     oneDst.secretOf(oneDst.store().connections[0]) === 'root-password')
+
+/* ---------------- conversations travel with their connections ---------------- */
+
+check('单条导出带上这条连接的对话',
+  one.bundle.agentHistory?.length === 1 && one.bundle.agentHistory[0].connectionId === 'c1',
+  JSON.stringify(one.bundle.agentHistory?.map((c) => c.connectionId)))
+const oneDstHistory = await historyFor(join(work, 'one'))
+check('对面看得到这段对话，标题是第一句话',
+  oneDstHistory.list('c1').length === 1 && oneDstHistory.list('c1')[0].title === '磁盘满了没',
+  JSON.stringify(oneDstHistory.list('c1')))
+check('导出没把别的机器的对话带过去', !(oneDstHistory.list('loose').length > 0))
+
+check('整机导出带上所有对话', (sealed.bundle.agentHistory?.length ?? 0) === 2,
+  JSON.stringify(sealed.bundle.agentHistory?.map((c) => c.connectionId)))
+check('对话里没有流式增量（只存落地的事件）',
+  sealed.bundle.agentHistory.every((c) => c.events.every((e) => e.kind !== 'delta')))
+check('文件里搜不到对话内容以外的私密字段',
+  !JSON.stringify(sealed.bundle.agentHistory).includes('root-password'))
 
 /* ---------------- one folder and its subtree ---------------- */
 

@@ -18,7 +18,10 @@ export const THRESHOLDS = {
   gpuMem: [85, 95],
   gpuTemp: [75, 88],
   /** Load average per core: 1.0 means the queue is exactly the CPU count. */
-  load: [1.5, 2.5]
+  load: [1.5, 2.5],
+  /** Round-trip milliseconds to the server. 100 ms is where typing starts to
+   *  feel laggy, 300 ms is where people stop using the tab. */
+  latency: [100, 300]
 } as const satisfies Record<string, readonly [number, number]>
 
 export type Metric = keyof typeof THRESHOLDS
@@ -54,6 +57,8 @@ export function alertsFor(m: MonitorSnapshot): Alert[] {
     flag(toneOf(swap, 'swap'), `Swap ${pct(swap)}`)
   }
   if (m.cpuCores) flag(toneOf(m.load[0] / m.cpuCores, 'load'), `负载 ${m.load[0].toFixed(2)}（${m.cpuCores} 核）`)
+  // -1 is "the probe could not connect", not a fast link.
+  if (m.latency && m.latency.rtt >= 0) flag(toneOf(m.latency.rtt, 'latency'), `延迟 ${m.latency.rtt} ms`)
 
   for (const d of m.disk) {
     const used = usePct(d.used, d.size)

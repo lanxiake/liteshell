@@ -26,6 +26,7 @@ import type {
 } from '../shared/types'
 import { openSecrets, sealSecrets } from './sealed'
 import { decryptSecret, encryptSecret } from './vault'
+import * as agentHistory from './agenthistory'
 
 const DEFAULTS: Settings = {
   theme: 'liteshell',
@@ -35,7 +36,7 @@ const DEFAULTS: Settings = {
   cursorBlink: true,
   scrollback: 5000,
   copyOnSelect: true,
-  rightClickPaste: true,
+  sidebarCollapsed: false,
   agentWidth: 520,
   llm: { provider: 'anthropic', baseUrl: '', model: 'claude-opus-5' }
 }
@@ -237,15 +238,30 @@ export function llmSettings(): LlmSettings {
   return { ...DEFAULTS.llm, ...llm, apiKey: decryptSecret(llm?.apiKey) }
 }
 
-export function hostKey(host: string, port: number): string | undefined {
-  return store().knownHosts.find((h) => h.host === host && h.port === port)?.fingerprint
+/** The key pinned for this connection profile. */
+export function hostKey(connId: string): string | undefined {
+  return store().knownHosts.find((h) => h.connId === connId)?.fingerprint
 }
 
-export function rememberHostKey(host: string, port: number, fingerprint: string): void {
+/** A key recorded before pinning was per connection. It carries no owner. */
+export function legacyHostKey(host: string, port: number): string | undefined {
+  return store().knownHosts.find(
+    (h) => h.connId === undefined && h.host === host && h.port === port
+  )?.fingerprint
+}
+
+export function rememberHostKey(
+  target: { id?: string; host: string; port: number },
+  fingerprint: string
+): void {
   const s = store()
-  const i = s.knownHosts.findIndex((h) => h.host === host && h.port === port)
+  const i = s.knownHosts.findIndex((h) =>
+    target.id
+      ? h.connId === target.id
+      : h.connId === undefined && h.host === target.host && h.port === target.port
+  )
   if (i >= 0) s.knownHosts[i].fingerprint = fingerprint
-  else s.knownHosts.push({ host, port, fingerprint })
+  else s.knownHosts.push({ connId: target.id, host: target.host, port: target.port, fingerprint })
   persist()
 }
 
@@ -469,7 +485,9 @@ export function exportBundle(
     ...(scoped
       ? {
           knownHosts: s.knownHosts.filter((h) =>
-            picked.some((c) => c.host === h.host && c.port === h.port)
+            h.connId
+              ? picked.some((c) => c.id === h.connId)
+              : picked.some((c) => c.host === h.host && c.port === h.port)
           )
         }
       : {
@@ -478,6 +496,10 @@ export function exportBundle(
           knownHosts: s.knownHosts
         })
   }
+  // What was already asked about these servers travels with them: the answer to
+  // "why is this box slow" is worth more than the password that got there.
+  const convos = agentHistory.forConnections(picked.map((c) => c.id))
+  if (convos.length) bundle.agentHistory = convos
   // Sealing an empty blob would ask the other side for a passphrase that guards
   // nothing, so an export with no secrets to hide stays a plain file.
   if (passphrase && passwords) bundle.secrets = sealSecrets(secrets, passphrase)
@@ -556,7 +578,9 @@ export function importBundle(bundle: BackupBundle, keyDir: string, passphrase = 
   mergeImport(bundle.folders ?? [], connections)
   if (bundle.llm) applyLlm(bundle.llm, secrets.llmKey)
   if (bundle.settings) applyAppearance(bundle.settings)
-  for (const h of bundle.knownHosts ?? []) rememberHostKey(h.host, h.port, h.fingerprint)
+  for (const h of bundle.knownHosts ?? [])
+    rememberHostKey({ id: h.connId, host: h.host, port: h.port }, h.fingerprint)
+  if (bundle.agentHistory?.length) agentHistory.merge(bundle.agentHistory)
   const s = store()
   for (const key of library) {
     const i = s.keys.findIndex((k) => k.id === key.id)
