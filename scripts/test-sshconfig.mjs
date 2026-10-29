@@ -27,7 +27,7 @@ await build({
   outfile: bundle,
   logLevel: 'silent'
 })
-const { sshAlias, sshConfigWith } = await import(`file://${bundle.replaceAll('\\', '/')}`)
+const { aliasFor, sshAlias, sshConfigWith } = await import(`file://${bundle.replaceAll('\\', '/')}`)
 
 /* ---------------- alias ---------------- */
 
@@ -39,6 +39,33 @@ check(
   sshAlias('10.7.8.9', ['10.7.8.9', '10.7.8.9-b']) === '10.7.8.9-a'
 )
 check('别的地址的占用不影响这个', sshAlias('10.0.0.1', ['10.0.0.2', '10.0.0.2-a']) === '10.0.0.1')
+
+/* ---------------- which alias a profile ends up with ---------------- */
+
+const mine = { id: 'c1', host: '10.7.8.9' }
+check('第一次配置用地址本身', aliasFor(mine, [mine]) === '10.7.8.9')
+check(
+  '别的目录里同 IP 的连接也算占用 —— 判断是全局的',
+  aliasFor(mine, [mine, { id: 'c2', host: '10.7.8.9', sshAlias: '10.7.8.9' }]) === '10.7.8.9-a'
+)
+check(
+  '已存的名字没人抢就保留，重复配置不会往下走字母',
+  aliasFor({ ...mine, sshAlias: '10.7.8.9-b' }, [
+    { id: 'c0', host: '10.7.8.9', sshAlias: '10.7.8.9' },
+    { ...mine, sshAlias: '10.7.8.9-b' }
+  ]) === '10.7.8.9-b'
+)
+check(
+  '复制来的连接继承了别人的名字，会重新分一个',
+  aliasFor({ id: 'c3', host: '10.7.8.9', sshAlias: '10.7.8.9' }, [
+    { id: 'c1', host: '10.7.8.9', sshAlias: '10.7.8.9' },
+    { id: 'c3', host: '10.7.8.9', sshAlias: '10.7.8.9' }
+  ]) === '10.7.8.9-a'
+)
+check(
+  '地址改过之后旧名字作废',
+  aliasFor({ id: 'c1', host: '10.0.0.5', sshAlias: '10.7.8.9' }, [{ id: 'c1', host: '10.0.0.5', sshAlias: '10.7.8.9' }]) === '10.0.0.5'
+)
 
 /* ---------------- config block ---------------- */
 

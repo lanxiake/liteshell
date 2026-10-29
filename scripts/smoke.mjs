@@ -895,20 +895,37 @@ async function main() {
       cdp,
       `(() => {
          const box = document.querySelector('.suggest').getBoundingClientRect()
-         const term = document.querySelector('.term-box').getBoundingClientRect()
          const screen = document.querySelector('.xterm-screen').getBoundingClientRect()
+         const pane = document.querySelector('.pane.active').getBoundingClientRect()
          return JSON.stringify({
-           boxTop: Math.round(box.top), termBottom: Math.round(term.bottom),
-           screenBottom: Math.round(screen.bottom), boxWidth: Math.round(box.width),
-           paneWidth: Math.round(document.querySelector('.pane.active').getBoundingClientRect().width)
+           boxTop: Math.round(box.top), boxBottom: Math.round(box.bottom),
+           boxWidth: Math.round(box.width), screenTop: Math.round(screen.top),
+           screenBottom: Math.round(screen.bottom), paneWidth: Math.round(pane.width),
+           position: getComputedStyle(document.querySelector('.suggest')).position
          })
        })()`
     )
   )
-  check('候选框落在终端下方（像输入法）', geo.boxTop >= geo.termBottom, JSON.stringify(geo))
-  check('候选框不压住终端里的内容', geo.boxTop >= geo.screenBottom, JSON.stringify(geo))
+  // The candidate box floats over the terminal instead of taking a row of it:
+  // an in-flow box resized the terminal every time the list changed, and the
+  // shell redrew its prompt a few lines higher. That was the jump.
+  check('候选框是浮层，不占布局', geo.position === 'absolute', JSON.stringify(geo))
+  check('候选框落在输入行下面（像输入法）', geo.boxTop >= geo.screenTop, JSON.stringify(geo))
   check('候选框没有横跨整个面板', geo.boxWidth <= 460 && geo.boxWidth < geo.paneWidth, JSON.stringify(geo))
+  // Rows and pty stay put while the list comes and goes.
+  const dims = await evaluate(
+    cdp,
+    `(() => { const s = document.querySelector('.pane.active');
+       return JSON.stringify({ rows: s.querySelector('.xterm-screen').getBoundingClientRect().height }) })()`
+  )
   await key('u', 85, 2)
+  await sleep(200)
+  const dimsAfter = await evaluate(
+    cdp,
+    `(() => { const s = document.querySelector('.pane.active');
+       return JSON.stringify({ rows: s.querySelector('.xterm-screen').getBoundingClientRect().height }) })()`
+  )
+  check('候选框出现或消失时终端尺寸不动（输入框不跳）', dims === dimsAfter, `${dims} vs ${dimsAfter}`)
 
   /* ---------------- follow-up options ---------------- */
 
@@ -1096,10 +1113,18 @@ async function main() {
 
   /* ---------------- resource monitor ---------------- */
 
-  await evaluate(
-    cdp,
-    `[...document.querySelectorAll('.tbtn')].find(b => b.textContent === '监控').click()`
-  )
+  // A tab opens onto a live box with the panel already shown, so this is
+  // "make sure it is open", not "toggle": clicking a visible button hides it and
+  // every measurement below then reads a zero-width panel.
+  const MON_BTN = `[...document.querySelectorAll('.pane.active .tbtn')].find(b => b.textContent === '监控')`
+  const ensureMon = (open) =>
+    evaluate(cdp, `(() => {
+      const b = ${MON_BTN}
+      const on = document.querySelector('.pane.active .monitor').style.display !== 'none'
+      if (on !== ${open}) b.click()
+      return true
+    })()`)
+  await ensureMon(true)
   if (
     await waitFor(cdp, `document.querySelector('.mon-host')?.textContent === 'smoke-host'`, '监控面板取到服务器信息')
   ) {
@@ -1201,10 +1226,7 @@ async function main() {
   check('监控走的是独立的 exec 通道', execCount > 0, `execCount=${execCount}`)
 
   // Polling must stop when the panel is closed, not keep running in the background.
-  await evaluate(
-    cdp,
-    `[...document.querySelectorAll('.tbtn')].find(b => b.textContent === '监控').click()`
-  )
+  await ensureMon(false)
   const before = execCount
   await sleep(3200)
   check('关闭面板后停止采样', execCount === before, `${before} -> ${execCount}`)
@@ -1232,12 +1254,13 @@ async function main() {
     '进度条走到 100%',
     (await evaluate(cdp, `document.querySelector('.xfer .pbar-fill').style.width`)) === '100%'
   )
+  // The arrow is the direction at a glance; the name is what was uploaded.
   check(
     '上传清单显示文件名与已完成状态',
     (await evaluate(
       cdp,
       `document.querySelector('.xfer .xfer-name').textContent + '|' + document.querySelector('.xfer-count').textContent`
-    )) === 'dropped.bin|1 项'
+    )) === '↑ dropped.bin|1 项'
   )
   check('文件确实写到了远端', existsSync(join(sftpRoot, 'dropped.bin')))
   check(
@@ -1918,15 +1941,23 @@ async function main() {
       (await evaluate(cdp, `(() => {
         const a = document.querySelector('.pane.active .agent').getBoundingClientRect()
         const r = document.querySelector('.pane.active .term-row').getBoundingClientRect()
+        window.__wide = a.width + ' / ' + r.width
         return a.width >= r.width - 2
-      })()`)) === true)
+      })()`)) === true,
+    await evaluate(cdp, `window.__wide`))
   await evaluate(cdp, `${wideBtn}.click()`)
   check('再点一次终端回来', await waitFor(cdp, `${shown('.pane.active .term-box')}`, '终端回来'))
 
   const beforeA = llmSeen.length
   await sendMsg('根目录有什么')
-  check('只读的 ls 不问就直接跑了', await waitFor(cdp, `!!document.querySelector('.pane.active .agent-log .agent-msg.result')`, 'ls 结果', 30000))
-  check('工具行写的是它真的要跑的那条', (await evaluate(cdp, `document.querySelector('.pane.active .agent-msg.tool').textContent`)) === '▶ ls /')
+  check('只读的 ls 不问就直接跑了', await waitFor(cdp, `!!document.querySelector('.pane.active .agent-log .agent-step-body')`, 'ls 结果', 30000))
+  check('工具行写的是它真的要跑的那条',
+    (await evaluate(cdp, `document.querySelector('.pane.active .agent-step-head').textContent`)) === 'ls /')
+  check('命令和它的输出在同一个折叠块里，不是两个各自漂着的块',
+    (await evaluate(cdp, `(() => {
+      const s = document.querySelector('.pane.active .agent-step')
+      return !!s.querySelector('.agent-step-body') && s.textContent.length > s.querySelector('.agent-step-head').textContent.length
+    })()`)) === true)
   check('只读工具一张确认卡都没弹', (await evaluate(cdp, `document.querySelectorAll('.pane.active .agent-ask').length`)) === 0)
   check('模型拿到的是系统提示 + 用户那句话',
     llmSeen[beforeA]?.messages?.[0]?.role === 'system' &&
@@ -2030,7 +2061,14 @@ async function main() {
   // moment the transcript would otherwise be sent somewhere it cannot be read.
   check('换了接口，旧对话不再硬塞给新接口', await waitFor(cdp, `${LOG}.includes('从这里重新开始')`, '接口切换提示'))
   check('Anthropic 那边也跑起来了：一轮里两个只读调用都执行了',
-    await waitFor(cdp, `${LOG}.includes('▶ ls /') && ${LOG}.includes('▶ monitor')`, '两个工具都跑了', 30000))
+    await waitFor(
+      cdp,
+      `(() => {
+         const heads = [...document.querySelectorAll('.pane.active .agent-step-head')].map(h => h.textContent)
+         return heads.includes('ls /') && heads.some(h => h.startsWith('monitor'))
+       })()`,
+      '两个工具都跑了',
+      30000))
   check('Anthropic 的 system 是顶层参数，没被忘掉',
     typeof claudeSeen[0]?.system === 'string' && claudeSeen[0].system.includes('规矩'))
   check('换接口之后的历史是干净的（只有这一句话）',
@@ -2144,7 +2182,18 @@ async function main() {
     await waitFor(cdp, `!!document.querySelector('#overlay .history-view .agent-msg.user')`, '历史正文'))
   check('历史里的回复也是渲染过的 Markdown',
     await evaluate(cdp, `!!document.querySelector('#overlay .history-view .agent-msg.assistant.md')`))
-  await evaluate(cdp, `[...document.querySelectorAll('#overlay .modal footer .btn')].find(b => b.textContent === '返回').click()`)
+  check('历史对话里能接着问', await evaluate(cdp,
+    `[...document.querySelectorAll('#overlay .modal footer .btn')].some(b => b.textContent === '继续这个对话')`))
+  await evaluate(cdp, `[...document.querySelectorAll('#overlay .modal footer .btn')].find(b => b.textContent === '继续这个对话').click()`)
+  check('继续之后的历史真的回到了面板里（面板打开、问题都在、确认卡不能点）',
+    await waitFor(cdp, `(() => {
+      const log = document.querySelector('.pane.active .agent-log')
+      const panel = document.querySelector('.pane.active .agent')
+      return document.querySelector('#overlay').hidden && panel.style.display !== 'none' &&
+        log.querySelectorAll('.agent-msg.user').length > 0 &&
+        [...log.querySelectorAll('.agent-ask')].every(c => !c.querySelector('.agent-ask-btns'))
+    })()`, '继续历史对话'))
+  await evaluate(cdp, `document.querySelector('.pane.active [title="查看并导出这台机器的历史对话"]').click()`)
   check('返回回到列表', await waitFor(cdp, `document.querySelectorAll('#overlay .hist-item').length >= 1`, '回到列表'))
   await evaluate(cdp, `document.querySelector('#overlay').dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))`)
   await waitFor(cdp, `document.querySelector('#overlay').hidden`, '历史面板关闭')
@@ -2220,10 +2269,100 @@ async function main() {
     )
   }
 
+  /* ---------------- embedded remote desktop ---------------- */
+
+  // The smoke SSH server has no RDP service and refuses direct-tcpip. That is
+  // enough to exercise the whole path through its failure: menu → dialog → SSH
+  // → proxy → WASM client in its own window → a readable error. The happy path
+  // needs a real GNOME/xrdp host, which a smoke run cannot provide.
+  await evaluate(cdp, `(() => {
+    const node = [...document.querySelectorAll('.node')].find(n => n.querySelector('.label')?.textContent === 'local-smoke')
+    node.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 200, clientY: 300 }))
+  })()`)
+  await evaluate(
+    cdp,
+    `[...document.querySelectorAll('#menu div')].find(d => d.textContent === '远程桌面 (RDP)…').click()`
+  )
+  check(
+    '连接菜单能打开远程桌面对话框',
+    await waitFor(
+      cdp,
+      `document.querySelector('#overlay .modal h2')?.textContent === '远程桌面 — local-smoke'`,
+      '远程桌面对话框'
+    )
+  )
+  await evaluate(cdp, `(() => {
+    const wrap = [...document.querySelectorAll('#overlay .field')].find(f => f.querySelector('label')?.textContent.includes('RDP 密码'))
+    wrap.querySelector('input').value = 'smoke-rdp'
+    ;[...document.querySelectorAll('#overlay .modal footer .btn')].find(b => b.textContent === '内嵌打开').click()
+  })()`)
+  let deskTarget
+  for (let i = 0; i < 60 && !deskTarget; i++) {
+    await sleep(500)
+    deskTarget = (
+      await (await fetch(`http://127.0.0.1:${DEBUG_PORT}/json/list`)).json()
+    ).find((t) => t.type === 'page' && t.url.includes('desktop='))
+  }
+  check('内嵌远程桌面有自己的窗口', !!deskTarget)
+  if (deskTarget) {
+    const deskConsole = []
+    const cdpDesk = await connect(deskTarget.webSocketDebuggerUrl, (msg) => {
+      if (msg.method === 'Runtime.consoleAPICalled') {
+        deskConsole.push(`[${msg.params.type}] ${msg.params.args.map((a) => a.value ?? a.description ?? '').join(' ')}`)
+      }
+      if (msg.method === 'Runtime.exceptionThrown') {
+        deskConsole.push(`[exception] ${msg.params.exceptionDetails.exception?.description ?? msg.params.exceptionDetails.text}`)
+      }
+    })
+    await cdpDesk.send('Runtime.enable')
+    check(
+      '窗口里是桌面画布，不是普通标签页',
+      await evaluate(
+        cdpDesk,
+        `document.body.classList.contains('desktop-popout') && !!document.querySelector('canvas.desktop-canvas')`
+      )
+    )
+    check(
+      '没有 RDP 服务时显示可读的错误，而不是空白画布',
+      await waitFor(
+        cdpDesk,
+        `!document.querySelector('.desktop-error').hidden && document.querySelector('.desktop-error').textContent.trim().length > 0`,
+        '桌面错误提示',
+        45000
+      ),
+      await evaluate(cdpDesk, `document.querySelector('.desktop-error').textContent`)
+    )
+    check(
+      '状态条说连接失败',
+      await evaluate(cdpDesk, `document.querySelector('.desktop-status').textContent === '连接失败'`)
+    )
+    const appOut = log.map(([, d]) => d).join('')
+    check(
+      '主进程记下了转发失败的原因和目标端口',
+      /RDCleanPath failed: 转发到远端 127\.0\.0\.1:3389/.test(appOut),
+      appOut.split('\n').filter((l) => l.includes('[rdp]')).slice(-5).join(' | ')
+    )
+    check(
+      'WASM 组件在 CSP 下加载，没有安全策略报错',
+      !deskConsole.some((l) => /Content Security Policy|Refused to/.test(l)),
+      deskConsole.join(' | ')
+    )
+    await evaluate(cdpDesk, `document.querySelector('.desktop-btn[title="关闭"]').click()`).catch(() => undefined)
+    cdpDesk.close()
+    let gone = false
+    for (let i = 0; i < 20 && !gone; i++) {
+      await sleep(300)
+      gone = !(await (await fetch(`http://127.0.0.1:${DEBUG_PORT}/json/list`)).json()).some(
+        (t) => t.type === 'page' && t.url.includes('desktop=')
+      )
+    }
+    check('关掉窗口就结束了这条内嵌会话', gone)
+  }
+
   /* ---------------- panel dividers and the updater ---------------- */
 
   // The monitor's divider: a drag has to change its width, not just look like a handle.
-  await evaluate(cdp, `document.querySelector('.pane.active [data-act="monitor"]').click()`)
+  await ensureMon(true)
   await waitFor(cdp, `!!document.querySelector('.pane.active .monitor .panel-grip')`, '监控面板把手')
   const widthBefore = await evaluate(cdp, `Math.round(document.querySelector('.pane.active .monitor').getBoundingClientRect().width)`)
   await evaluate(cdp, `(() => {
@@ -2239,7 +2378,7 @@ async function main() {
     '文件面板也有同一根分隔线',
     await evaluate(cdp, `!!document.querySelector('.pane.active .files .panel-grip')`)
   )
-  await evaluate(cdp, `document.querySelector('.pane.active [data-act="monitor"]').click()`)
+  await ensureMon(false)
 
   await evaluate(cdp, `document.querySelector('#btn-settings').click()`)
   await waitFor(cdp, `!!document.querySelector('#overlay .modal h2')?.textContent?.includes('设置')`, '开设置找更新')

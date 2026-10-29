@@ -16,7 +16,23 @@
  * this whole design. (Measured elsewhere: people approve 97% of prompts, and
  * detection of the dangerous one drops to ~5% after fifty of them.)
  */
-const READ_TOOLS = new Set(['read_output', 'monitor', 'ls', 'cat'])
+const READ_TOOLS = new Set(['read_output', 'monitor', 'ls', 'cat', 'list_connections'])
+
+/**
+ * File transfers. Never automatic, in either direction: an upload can overwrite
+ * a remote file, and a download writes to the user's own disk — which is a
+ * boundary the shell classifier knows nothing about, so the tool name decides
+ * here before any command text is looked at.
+ */
+const TRANSFER_TOOLS = new Set(['upload', 'download'])
+
+/**
+ * Writes to the client's own connection list, not the server. Same rule as a
+ * transfer and for the same reason: it crosses out of the remote box onto the
+ * user's machine, and the command classifier below has never heard of a host
+ * address. Matched by name before any text is looked at.
+ */
+const CONFIG_TOOLS = new Set(['save_connection', 'save_folder'])
 
 export type Risk = 'safe' | 'risky' | 'critical'
 
@@ -141,6 +157,8 @@ export interface Verdict {
 
 export function gate(tool: string, command = ''): Verdict {
   if (READ_TOOLS.has(tool)) return { auto: true, risk: 'safe', why: '只读' }
+  if (TRANSFER_TOOLS.has(tool)) return { auto: false, risk: 'risky', why: WHY.files }
+  if (CONFIG_TOOLS.has(tool)) return { auto: false, risk: 'risky', why: WHY.config }
   // An empty command is a model mistake, not a safe one: it is shown as a card
   // so the person sees that nothing was proposed.
   if (!command.trim()) return { auto: false, risk: 'safe', why: '空命令' }
@@ -150,9 +168,11 @@ export function gate(tool: string, command = ''): Verdict {
   return { auto: true, risk, why: risk === 'safe' ? WHY.safe : WHY.changes }
 }
 
-const WHY: Record<'safe' | 'changes' | 'data' | 'critical', string> = {
+const WHY: Record<'safe' | 'changes' | 'data' | 'critical' | 'files' | 'config', string> = {
   safe: '只读命令',
   changes: '改了服务器，但可以改回来',
   data: '会删除或覆盖数据，这一步退不回来',
-  critical: '命中高危模式：这类命令没有撤销'
+  critical: '命中高危模式：这类命令没有撤销',
+  files: '要读写文件：远端同名文件会被覆盖，或写进本机磁盘',
+  config: '要改本机的连接列表：这条只动这台客户端，不碰服务器'
 }

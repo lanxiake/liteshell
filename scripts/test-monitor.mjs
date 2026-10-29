@@ -46,6 +46,9 @@ tmpfs            8000000         0   8000000       0% /dev/shm
 @@LOAD
 0.52 0.58 0.59 1/234 5678
 98765.43 1234567.89
+@@PROC
+1234|root|45.2|3.1|204800|1048576|2097152|java|/usr/lib/jvm/bin/java|java -Xmx2g -jar /opt/app.jar --port 8080
+5678|www-data|0.5|0.2|10240|4096|8192|nginx||nginx: worker process
 @@INFO
 hostname=web-01
 kernel=Linux 5.15.0-91-generic
@@ -115,6 +118,18 @@ check('解析出一块 GPU', m.gpu.length === 1, `got ${m.gpu.length}`)
 check('GPU 利用率与温度', m.gpu[0].util === 37 && m.gpu[0].temp === 45, JSON.stringify(m.gpu[0]))
 check('显存 MiB 换算成字节', m.gpu[0].memTotal === 15360 * 1024 * 1024, `got ${m.gpu[0].memTotal}`)
 
+/* ---------------- processes ---------------- */
+check('解析出两个进程', m.proc.length === 2, `got ${m.proc.length}`)
+check('PID 与 CPU', m.proc[0].pid === 1234 && near(m.proc[0].cpu, 45.2), JSON.stringify(m.proc[0]))
+check('内存百分比与 RSS 字节数', m.proc[0].mem === 3.1 && m.proc[0].rss === 204800 * 1024, JSON.stringify(m.proc[0]))
+check('磁盘读写换算成字节', m.proc[0].diskRead === 1048576 * 1024 && m.proc[0].diskWrite === 2097152 * 1024,
+  JSON.stringify(m.proc[0]))
+check('命令名与可执行路径', m.proc[0].name === 'java' && m.proc[0].path === '/usr/lib/jvm/bin/java', JSON.stringify(m.proc[0]))
+check('命令行原样保留（含空格和参数）', m.proc[0].cmd.endsWith('--port 8080'), m.proc[0].cmd)
+// 别的用户的进程读不到 /proc/pid/exe，位置那一栏要退回命令行而不是空着。
+check('读不到 exe 时位置退回命令行', m.proc[1].path === undefined && m.proc[1].cmd === 'nginx: worker process',
+  JSON.stringify(m.proc[1]))
+
 /* ---------------- degradation: no tools, no gpu, ancient kernel ---------------- */
 const bare = parseMonitor(`@@A
 cpu  100 0 0 100 0 0 0 0 0 0
@@ -131,6 +146,7 @@ kernel=Linux 3.10.0
 check('没有 nvidia-smi 时 GPU 列表为空', bare.gpu.length === 0)
 check('没有 MemAvailable 时退回 MemFree', bare.memUsed === (1000000 - 200000) * 1024, `got ${bare.memUsed}`)
 check('没有 /proc/net/dev 时速率为 0', bare.netDown === 0 && bare.netUp === 0)
+check('没有进程列表时是空数组而不是 undefined', Array.isArray(bare.proc) && bare.proc.length === 0)
 check('没有网卡时累计流量为空列表而不是 undefined', Array.isArray(bare.netTotals) && bare.netTotals.length === 0)
 check('没有 nproc 时核心数为 0 而不是 NaN', bare.cpuCores === 0)
 check('完全没有输出也不抛异常', parseMonitor('').cpu === 0)

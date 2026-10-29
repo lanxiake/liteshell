@@ -41,17 +41,22 @@
     "test:textfile": "node scripts/test-textfile.mjs",
     "test:commands": "node scripts/test-commands.mjs",
     "test:alerts": "node scripts/test-alerts.mjs",
+    "test:compact": "node scripts/test-compact.mjs",
+    "test:skill": "node scripts/test-skill.mjs",
     "sha256": "node scripts/make-sha256.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.135.0",
     "des.js": "^1.1.0",
+    "ironrdp-wasm": "^1.2.0",
     "openai": "^7.34.0",
-    "ssh2": "^1.17.0"
+    "ssh2": "^1.17.0",
+    "ws": "^8.21.3"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "@types/ssh2": "^1.15.5",
+    "@types/ws": "^8.18.2",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-search": "^0.16.0",
     "@xterm/addon-web-links": "^0.12.0",

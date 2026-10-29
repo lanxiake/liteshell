@@ -26,6 +26,7 @@ import type {
 } from '../shared/types'
 import { openSecrets, sealSecrets } from './sealed'
 import { decryptSecret, encryptSecret } from './vault'
+import { aliasFor } from './sshconfig'
 import * as agentHistory from './agenthistory'
 
 const DEFAULTS: Settings = {
@@ -38,7 +39,8 @@ const DEFAULTS: Settings = {
   copyOnSelect: true,
   sidebarCollapsed: false,
   agentWidth: 520,
-  llm: { provider: 'anthropic', baseUrl: '', model: 'claude-opus-5' }
+  backgroundImage: '',
+  llm: { provider: 'anthropic', baseUrl: '', model: 'claude-opus-5', contextK: 128 }
 }
 
 const EMPTY: Store = {
@@ -146,9 +148,13 @@ export function mergeImport(
   for (const conn of connections) {
     const plain = secrets[conn.id]
     const sealed = plain ? encryptSecret(plain) : undefined
+    // An imported alias may belong to a profile that is already here; the
+    // import loses the tie, so the local `ssh <ip>` keeps pointing where it did.
+    const unique = conn.sshAlias ? aliasFor(conn, s.connections) : undefined
+    const merged = unique === undefined ? conn : { ...conn, sshAlias: unique }
     const i = s.connections.findIndex((c) => c.id === conn.id)
-    if (i >= 0) s.connections[i] = { ...conn, secret: s.connections[i].secret ?? sealed }
-    else s.connections.push(sealed ? { ...conn, secret: sealed } : conn)
+    if (i >= 0) s.connections[i] = { ...merged, secret: s.connections[i].secret ?? sealed }
+    else s.connections.push(sealed ? { ...merged, secret: sealed } : merged)
   }
   persist()
 }
@@ -158,7 +164,11 @@ export function duplicateConnection(id: string): void {
   const src = s.connections.find((c) => c.id === id)
   if (!src) return
   // Cloning keeps the encrypted secret, so the copy connects without retyping.
-  s.connections.push({ ...src, id: `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, name: `${src.name} 副本` })
+  // The alias is dropped: two profiles holding one name would make `ssh <ip>`
+  // point at whichever block was written last, and the copy gets its own on
+  // first setup.
+  const { sshAlias: _drop, ...rest } = src
+  s.connections.push({ ...rest, id: `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, name: `${src.name} 副本` })
   persist()
 }
 
@@ -491,7 +501,7 @@ export function exportBundle(
           )
         }
       : {
-          llm: { provider: llm.provider, baseUrl: llm.baseUrl, model: llm.model },
+          llm: { provider: llm.provider, baseUrl: llm.baseUrl, model: llm.model, contextK: llm.contextK },
           settings: appearance,
           knownHosts: s.knownHosts
         })
@@ -622,6 +632,9 @@ export function applyLlm(llm: BundleLlm, apiKey?: string): void {
     llm: {
       ...DEFAULTS.llm,
       ...llm,
+      // A bundle written before the context window existed says nothing about
+      // this machine's window; 0 is not a number any dialog types in.
+      contextK: llm.contextK || DEFAULTS.llm.contextK,
       apiKey: apiKey ? encryptSecret(apiKey) : s.settings.llm?.apiKey
     }
   }

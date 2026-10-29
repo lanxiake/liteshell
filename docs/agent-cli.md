@@ -9,6 +9,11 @@
 cp -r skills/liteshell ~/.claude/skills/
 ```
 
+**不想找仓库？** 设置 →「导出 CLI + 技能包」选一个目录，会生成 `<目录>/liteshell/`，
+里面是同样的 `SKILL.md`、CLI 和一份写清各客户端装法的 `README.md`。Cline、Roo Code、Cherry Studio
+这类支持技能目录的直接放进去；Cursor、Windsurf、Codex CLI 这类只有 rules 的，把 `SKILL.md` 正文
+粘进去、把路径换成绝对路径即可。装的是同一份字节——`npm run test:skill` 用的是仓库里这份。
+
 CLI 里没有一行 SSH 代码——它通过本机 socket 把活交给**正在运行的** LiteShell 主进程去做。
 凭据、已知主机、连接复用全走界面里那一套，agent 的每一步都开在真实标签页里，你能看着，也能随时接管。
 

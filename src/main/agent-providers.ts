@@ -13,38 +13,13 @@
  */
 import Anthropic from '@anthropic-ai/sdk'
 import OpenAI from 'openai'
-import type { LlmSettings } from '../shared/types'
+import type { Call, LlmSettings, Msg, ToolResult } from '../shared/types'
 
 export interface ToolSpec {
   name: string
   description: string
   parameters: Record<string, unknown>
 }
-
-export interface Call {
-  id: string
-  name: string
-  /** null when the streamed JSON did not parse — the caller must not run it. */
-  args: Record<string, unknown> | null
-}
-
-export interface ToolResult {
-  id: string
-  text: string
-  isError: boolean
-}
-
-/**
- * The conversation in a shape both dialects can read. `echo` is what goes back
- * verbatim as the assistant turn: Anthropic's content blocks (a thinking block
- * that comes back modified is a 400) and OpenAI's tool_calls plus whatever
- * reasoning channel the endpoint uses — DeepSeek rejects a tool-using history
- * that drops `reasoning_content`.
- */
-export type Msg =
-  | { role: 'user'; text: string }
-  | { role: 'assistant'; text: string; calls: Call[]; echo: unknown }
-  | { role: 'result'; results: ToolResult[] }
 
 export interface Turn {
   text: string
@@ -59,7 +34,10 @@ export interface Provider {
     messages: Msg[],
     tools: ToolSpec[],
     onDelta: (text: string) => void,
-    signal: AbortSignal
+    signal: AbortSignal,
+    /** Replaces the system prompt for this one request. Used by the summariser,
+     *  which runs on the same endpoint with its own instructions. */
+    system?: string
   ): Promise<Turn>
 }
 
@@ -110,12 +88,12 @@ function anthropicProvider(s: LlmSettings, system: string): Provider {
   }
 
   return {
-    async turn(messages, tools, onDelta, signal) {
+    async turn(messages, tools, onDelta, signal, sys) {
       const stream = client.messages.stream(
         {
           model: s.model,
           max_tokens: 8192,
-          system,
+          system: sys ?? system,
           ...(tools.length
             ? {
                 tools: tools.map((t) => ({
@@ -191,11 +169,11 @@ function openaiProvider(s: LlmSettings, system: string): Provider {
     maxRetries: 1
   })
 
-  const flatten = (messages: Msg[]): OpenAI.Chat.ChatCompletionMessageParam[] =>
+  const flatten = (messages: Msg[], sys: string): OpenAI.Chat.ChatCompletionMessageParam[] =>
     // The system prompt rides in the message list — this dialect has no separate
     // field for it, so forgetting it here means the model never hears the rules.
     [
-      { role: 'system' as const, content: system },
+      { role: 'system' as const, content: sys },
       ...messages.flatMap((m): OpenAI.Chat.ChatCompletionMessageParam[] => {
         if (m.role === 'user') return [{ role: 'user', content: m.text }]
         if (m.role === 'assistant') {
@@ -208,11 +186,11 @@ function openaiProvider(s: LlmSettings, system: string): Provider {
     ]
 
   return {
-    async turn(messages, tools, onDelta, signal) {
+    async turn(messages, tools, onDelta, signal, sys) {
       const stream = await client.chat.completions.create(
         {
           model: s.model,
-          messages: flatten(messages),
+          messages: flatten(messages, sys ?? system),
           ...(tools.length
             ? {
                 tools: tools.map((t) => ({

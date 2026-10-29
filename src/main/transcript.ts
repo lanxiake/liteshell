@@ -34,6 +34,8 @@ function block(ev: AgentEvent): string[] {
       return [`**待确认 · ${ev.name}（${{ safe: '只读', risky: '有改动', critical: '高危' }[ev.risk] ?? ev.risk}）**`, '', '```', ev.detail, '```', '', `_${ev.why}_`, '']
     case 'error':
       return [`**错误**：${ev.message}`, '']
+    case 'compact':
+      return ['> 【早先的对话已压缩】', '', ev.note, '']
     case 'delta':
       return []
     case 'done':

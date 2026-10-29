@@ -31,6 +31,91 @@ const plain = (s: string): string => s.replace(ANSI, '').replace(/\r/g, '')
  *  the whole thing goes to a file anyway; this only stops `yes` from eating RAM. */
 const MAX_SHELL_OUT = 256_000
 
+/**
+ * Trust-on-first-use, pinned per connection profile rather than per address:
+ * two environments can share an IP and each gets its own key. A key that
+ * changes for a profile we already know is refused outright.
+ *
+ * Shared by terminal sessions and the remote-desktop tunnel: both authenticate
+ * as the same profile, so they must agree about what the host's key is.
+ */
+export function checkHostKey(
+  conn: Connection,
+  key: Buffer,
+  onInfo?: (info: { fingerprint: string; known: boolean; changed: boolean }) => void
+): boolean {
+  const fingerprint = 'SHA256:' + createHash('sha256').update(key).digest('base64').replace(/=+$/, '')
+  const known = hostKey(conn.id)
+  if (known) {
+    if (known !== fingerprint) {
+      onInfo?.({ fingerprint, known: true, changed: true })
+      return false
+    }
+    return true
+  }
+  // A record from before per-connection pinning has no owner, so it is only
+  // adopted when it names this exact key; otherwise this profile is meeting
+  // the host for the first time and gets the usual first-contact trust.
+  const legacy = legacyHostKey(conn.host, conn.port)
+  rememberHostKey(conn, fingerprint)
+  if (legacy === fingerprint) return true
+  onInfo?.({ fingerprint, known: false, changed: false })
+  return true
+}
+
+/**
+ * Everything ssh2 needs to authenticate, resolved once for both the terminal
+ * session and the desktop tunnel. Throws when a key connection has no file —
+ * the caller decides whether that becomes a failed tab or a failed launch.
+ */
+export function connectOptions(
+  conn: Connection,
+  secret: string | undefined,
+  hostVerifier: (key: Buffer) => boolean,
+  log: (level: 'debug' | 'info' | 'warn', text: string) => void = () => {}
+): Parameters<Client['connect']>[0] {
+  // Resolved here, once, so the log line and the socket agree on the answer.
+  const source = bindAddress(conn)
+  const opts: Parameters<Client['connect']>[0] = {
+    host: conn.host,
+    port: conn.port,
+    username: conn.username,
+    readyTimeout: 20_000,
+    keepaliveInterval: conn.keepalive > 0 ? conn.keepalive * 1000 : 0,
+    // Two VPNs can carry the same remote subnet; binding the source address
+    // picks the tunnel instead of letting the routing table decide. An
+    // interface name is resolved now, so a reconnected tunnel still matches.
+    ...(source ? { localAddress: source } : {}),
+    hostVerifier,
+    // Handshake detail goes to the log panel. It stops once the session is up,
+    // so what you read after a failure is exactly the part that failed.
+    debug: (msg: string) => log('debug', msg)
+  }
+  if (conn.localIface && !source) {
+    log('warn', `本机网卡 ${conn.localIface} 现在没有地址（VPN 断了？），这次不绑定出口`)
+  }
+
+  // A key's own passphrase is the fallback: connections reusing the same key
+  // file connect without asking, which is the point of storing it there.
+  const pass =
+    secret ||
+    secretOf(conn) ||
+    (conn.authType === 'key' && conn.privateKeyPath ? keySecretOf(conn.privateKeyPath) : '')
+
+  if (conn.authType === 'password') {
+    opts.password = pass
+    if (!pass) log('warn', '没有可用密码，将以空密码尝试认证')
+  } else if (conn.authType === 'key') {
+    const path = conn.privateKeyPath
+    if (!path || !existsSync(path)) throw new Error(`私钥文件不存在: ${path ?? '(未设置)'}`)
+    opts.privateKey = readFileSync(path)
+    if (pass) opts.passphrase = pass
+  } else {
+    opts.agent = conn.agentSocket || process.env.SSH_AUTH_SOCK
+  }
+  return opts
+}
+
 class Session {
   readonly id: string
   readonly conn: Connection
@@ -80,47 +165,17 @@ class Session {
 
   connect(cols: number, rows: number): void {
     const c = this.conn
-    // Resolved here, once, so the log line and the socket agree on the answer.
-    const source = bindAddress(c)
-    const opts: Parameters<Client['connect']>[0] = {
-      host: c.host,
-      port: c.port,
-      username: c.username,
-      readyTimeout: 20_000,
-      keepaliveInterval: c.keepalive > 0 ? c.keepalive * 1000 : 0,
-      // Two VPNs can carry the same remote subnet; binding the source address
-      // picks the tunnel instead of letting the routing table decide. An
-      // interface name is resolved now, so a reconnected tunnel still matches.
-      ...(source ? { localAddress: source } : {}),
-      hostVerifier: (key: Buffer) => this.verifyHostKey(key),
-      // Handshake detail goes to the log panel. It stops once the session is up,
-      // so what you read after a failure is exactly the part that failed.
-      debug: (msg: string) => this.log('debug', msg)
-    }
-    if (c.localIface && !source) {
-      this.log('warn', `本机网卡 ${c.localIface} 现在没有地址（VPN 断了？），这次不绑定出口`)
-    }
-
-    // A key's own passphrase is the fallback: connections reusing the same key
-    // file connect without asking, which is the point of storing it there.
-    const secret =
-      this.secret ||
-      secretOf(c) ||
-      (c.authType === 'key' && c.privateKeyPath ? keySecretOf(c.privateKeyPath) : '')
-
-    if (c.authType === 'password') {
-      opts.password = secret
-      if (!secret) this.log('warn', '没有可用密码，将以空密码尝试认证')
-    } else if (c.authType === 'key') {
-      const path = c.privateKeyPath
-      if (!path || !existsSync(path)) {
-        this.status('error', `私钥文件不存在: ${path ?? '(未设置)'}`)
-        return
-      }
-      opts.privateKey = readFileSync(path)
-      if (secret) opts.passphrase = secret
-    } else {
-      opts.agent = c.agentSocket || process.env.SSH_AUTH_SOCK
+    let opts: Parameters<Client['connect']>[0]
+    try {
+      opts = connectOptions(
+        c,
+        this.secret,
+        (key: Buffer) => this.verifyHostKey(key),
+        (level, text) => this.log(level, text)
+      )
+    } catch (err) {
+      this.status('error', (err as Error).message)
+      return
     }
 
     this.client.on('ready', () => {
@@ -163,29 +218,11 @@ class Session {
     }
   }
 
-  /**
-   * Trust-on-first-use, pinned per connection profile rather than per address:
-   * two environments can share an IP and each gets its own key. A key that
-   * changes for a profile we already know is refused outright.
-   */
+  /** Trust-on-first-use, shared with the desktop tunnel (see `checkHostKey`). */
   private verifyHostKey(key: Buffer): boolean {
-    const fingerprint = 'SHA256:' + createHash('sha256').update(key).digest('base64').replace(/=+$/, '')
-    const known = hostKey(this.conn.id)
-    if (known) {
-      if (known !== fingerprint) {
-        this.emit({ type: 'hostkey', sessionId: this.id, fingerprint, known: true, changed: true })
-        return false
-      }
-      return true
-    }
-    // A record from before per-connection pinning has no owner, so it is only
-    // adopted when it names this exact key; otherwise this profile is meeting
-    // the host for the first time and gets the usual first-contact trust.
-    const legacy = legacyHostKey(this.conn.host, this.conn.port)
-    rememberHostKey(this.conn, fingerprint)
-    if (legacy === fingerprint) return true
-    this.emit({ type: 'hostkey', sessionId: this.id, fingerprint, known: false, changed: false })
-    return true
+    return checkHostKey(this.conn, key, (info) =>
+      this.emit({ type: 'hostkey', sessionId: this.id, ...info })
+    )
   }
 
   /** Ctrl-C. The only way to call off a command already running on the prompt. */
@@ -685,7 +722,6 @@ export class SshManager {
 
   /** Downloads to `localDir`, returning the written path. */
   async download(sessionId: string, remotePath: string, localDir: string, isDir: boolean): Promise<string> {
-    const wrapper = await this.sftp(sessionId)
     const target = join(localDir, basename(remotePath))
     if (isDir) {
       mkdirSync(target, { recursive: true })
@@ -695,9 +731,7 @@ export class SshManager {
       return target
     }
     mkdirSync(dirname(target), { recursive: true })
-    await new Promise<void>((resolve, reject) =>
-      wrapper.fastGet(remotePath, target, (err) => (err ? reject(err) : resolve()))
-    )
+    await this.getOne(sessionId, remotePath, target)
     return target
   }
 
@@ -707,7 +741,6 @@ export class SshManager {
    * temp on the server. Names are shell-quoted because tar gets a command line.
    */
   async downloadArchive(sessionId: string, remotePath: string, localDir: string): Promise<string> {
-    const wrapper = await this.sftp(sessionId)
     const q = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`
     const name = basename(remotePath)
     const remoteTmp = `/tmp/liteshell-${randomBytes(4).toString('hex')}.tar.gz`
@@ -720,9 +753,7 @@ export class SshManager {
     }
     const target = join(localDir, `${name}.tar.gz`)
     try {
-      await new Promise<void>((resolve, reject) =>
-        wrapper.fastGet(remoteTmp, target, (err) => (err ? reject(err) : resolve()))
-      )
+      await this.getOne(sessionId, remoteTmp, target, `${name}.tar.gz`)
     } finally {
       void this.exec(sessionId, `rm -f ${q(remoteTmp)}`).catch(() => undefined)
     }
@@ -751,46 +782,86 @@ export class SshManager {
   /** One file, tracked in the transfer list with per-chunk progress. */
   private async putOne(sessionId: string, local: string, remote: string): Promise<void> {
     const wrapper = await this.sftp(sessionId)
+    const transfer = this.track(sessionId, 'upload', local, remote, statSync(local).size)
+    try {
+      await this.pump(transfer, (step, done) => wrapper.fastPut(local, remote, { step }, done))
+    } catch (err) {
+      this.fail(transfer, err)
+      throw err
+    }
+  }
+
+  /** One remote file down, with the same record and progress as an upload.
+   *  `name` overrides the displayed name for the temp file 打包下载 pulls. */
+  private async getOne(sessionId: string, remote: string, local: string, name = basename(local)): Promise<void> {
+    const wrapper = await this.sftp(sessionId)
+    const size = await new Promise<number>((resolve) =>
+      wrapper.stat(remote, (err, attrs) => resolve(err ? 0 : attrs.size))
+    )
+    mkdirSync(dirname(local), { recursive: true })
+    const transfer = this.track(sessionId, 'download', local, remote, size, name)
+    try {
+      await this.pump(transfer, (step, done) => wrapper.fastGet(remote, local, { step }, done))
+    } catch (err) {
+      this.fail(transfer, err)
+      throw err
+    }
+  }
+
+  private track(
+    sessionId: string,
+    direction: Transfer['direction'],
+    local: string,
+    remote: string,
+    size: number,
+    name = basename(local)
+  ): Transfer {
     const transfer: Transfer = {
       id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
       sessionId,
+      direction,
       local,
-      name: basename(local),
+      name,
       remote,
-      size: statSync(local).size,
+      size,
       transferred: 0,
       state: 'active'
     }
     this.transfers.set(transfer.id, transfer)
     this.emit({ type: 'transfer', sessionId, transfer: { ...transfer } })
+    return transfer
+  }
 
-    // ssh2 only calls `step` every ~32KB, so throttle the IPC to ~10/s per file.
+  /** Runs one fastPut/fastGet, posting progress. ssh2 only calls `step` every
+   *  ~32KB, so the IPC is throttled to ~10/s per file. */
+  private pump(
+    transfer: Transfer,
+    run: (step: (n: number) => void, done: (err?: Error | null) => void) => void
+  ): Promise<void> {
     let lastPost = 0
-    try {
-      await new Promise<void>((resolve, reject) => {
-        wrapper.fastPut(
-          local,
-          remote,
-          {
-            step: (transferred: number) => {
-              transfer.transferred = transferred
-              const now = Date.now()
-              if (now - lastPost < 100 && transferred < transfer.size) return
-              lastPost = now
-              this.emit({ type: 'transfer', sessionId, transfer: { ...transfer } })
-            }
-          },
-          (err) => (err ? reject(err) : resolve())
-        )
-      })
-      transfer.transferred = transfer.size
-      transfer.state = 'done'
-    } catch (err) {
-      transfer.state = 'failed'
-      transfer.error = (err as Error).message
-      this.emit({ type: 'transfer', sessionId, transfer: { ...transfer } })
-      throw err
-    }
-    this.emit({ type: 'transfer', sessionId, transfer: { ...transfer } })
+    return new Promise<void>((resolve, reject) => {
+      run(
+        (n) => {
+          transfer.transferred = n
+          const now = Date.now()
+          if (now - lastPost < 100 && n < transfer.size) return
+          lastPost = now
+          this.emit({ type: 'transfer', sessionId: transfer.sessionId, transfer: { ...transfer } })
+        },
+        (err) => {
+          if (err) return reject(err)
+          transfer.transferred = transfer.size
+          transfer.state = 'done'
+          this.emit({ type: 'transfer', sessionId: transfer.sessionId, transfer: { ...transfer } })
+          resolve()
+        }
+      )
+    })
+  }
+
+  private fail(transfer: Transfer, err: unknown): void {
+    transfer.state = 'failed'
+    transfer.error = (err as Error).message
+    this.emit({ type: 'transfer', sessionId: transfer.sessionId, transfer: { ...transfer } })
   }
 }

@@ -45,6 +45,14 @@ export interface Connection {
   termType: string
   /** Keepalive interval in seconds; 0 disables. */
   keepalive: number
+  /**
+   * Remote desktop (RDP) reached through this connection's SSH tunnel. Only
+   * the address of the service is remembered; the desktop's own credentials
+   * are typed into the system RDP client, never stored here.
+   */
+  rdpPort?: number
+  /** Login shown in the RDP client; defaults to the SSH user when absent. */
+  rdpUsername?: string
 }
 
 export interface QuickCommand {
@@ -88,7 +96,33 @@ export interface LlmSettings {
    *  main process ever sees this; the renderer gets `hasKey` instead. */
   apiKey?: string
   hasKey?: boolean
+  /** The model's context window, in K tokens. Used only to decide when the
+   *  conversation has to be compressed — nothing here counts tokens exactly. */
+  contextK: number
 }
+
+/* ---------------- AI 对话：两种方言共用的消息形状 ---------------- */
+
+export interface Call {
+  id: string
+  name: string
+  /** null when the streamed JSON did not parse — the caller must not run it. */
+  args: Record<string, unknown> | null
+}
+
+export interface ToolResult {
+  id: string
+  text: string
+  isError: boolean
+}
+
+/** The conversation in a shape both dialects can read. `echo` is what goes back
+ *  verbatim as the assistant turn: Anthropic's content blocks, OpenAI's
+ *  tool_calls plus whatever reasoning channel the endpoint uses. */
+export type Msg =
+  | { role: 'user'; text: string }
+  | { role: 'assistant'; text: string; calls: Call[]; echo: unknown }
+  | { role: 'result'; results: ToolResult[] }
 
 export interface Settings {
   theme: string
@@ -103,6 +137,10 @@ export interface Settings {
   /** Pixels the AI panel takes from the terminal. Dragged, so it is a view
    *  preference like the font — not something to re-decide every launch. */
   agentWidth: number
+  /** Absolute path of a picture drawn behind the terminal. Empty = none. The
+   *  renderer never reads the path itself: main turns it into a data URL, which
+   *  is what the page's CSP allows. */
+  backgroundImage: string
   llm: LlmSettings
 }
 
@@ -185,6 +223,27 @@ export interface DiskInfo {
   used: number
 }
 
+/** One row of the panel's process table: what `ps` would tell you about the
+ *  busiest processes, pruned down to what the eye can scan. */
+export interface ProcInfo {
+  pid: number
+  user: string
+  /** Percent of one core, the way top reports it. */
+  cpu: number
+  /** Percent of RAM. */
+  mem: number
+  /** Resident set size in bytes. */
+  rss: number
+  /** Bytes this process has read from and written to storage since it started. */
+  diskRead: number
+  diskWrite: number
+  name: string
+  /** Full command line, when ps gives one. */
+  cmd: string
+  /** The file that command line started, if it could be resolved without sudo. */
+  path?: string
+}
+
 export interface MonitorSnapshot {
   at: number
   /** Percentage over the interval between the two samples. */
@@ -205,6 +264,8 @@ export interface MonitorSnapshot {
   latency?: NetLatency
   disk: DiskInfo[]
   gpu: GpuInfo[]
+  /** The busiest few processes, for the panel's process table. */
+  proc: ProcInfo[]
   uptime: number
   info: {
     hostname: string
@@ -232,6 +293,7 @@ export type TransferState = 'queued' | 'active' | 'done' | 'failed'
 export interface Transfer {
   id: string
   sessionId: string
+  direction: 'upload' | 'download'
   /** Local filesystem path. */
   local: string
   name: string
@@ -359,6 +421,36 @@ export interface SessionInfo {
   error?: string
 }
 
+/** What starting a remote desktop handed back. The tunnel closes itself when
+ *  the external client exits; `tunnelId` is there for an early close too. */
+export interface DesktopLaunch {
+  tunnelId: string
+  /** Loopback port the SSH tunnel listens on. */
+  localPort: number
+  /** Which client was started, for the status line. */
+  client: string
+  /** The temporary `.rdp` file, when the client takes one. */
+  rdpFile?: string
+}
+
+/** An embedded desktop window was created; `id` is what the window attaches
+ *  with. No credentials are in this shape. */
+export interface DesktopEmbedded {
+  id: string
+  name: string
+}
+
+/** What the dedicated window needs from the main process. The password is
+ *  handed over once, in memory, and never stored. */
+export interface DesktopEmbeddedInfo extends DesktopEmbedded {
+  /** Loopback WebSocket URL of the RDCleanPath proxy. */
+  url: string
+  username: string
+  password: string
+  /** RDP port on the remote's loopback. */
+  port: number
+}
+
 /** The installer for this machine, as the release publishes it. */
 export interface UpdateAsset {
   name: string
@@ -421,6 +513,25 @@ export interface Api {
   disconnect(sessionId: string): Promise<void>
   disconnectAll(): Promise<void>
 
+  /** Opens an SSH tunnel to the connection's RDP service and starts the
+   *  system RDP client. Credentials for the desktop itself are not part of
+   *  this call — the client asks for them. */
+  desktopOpen(
+    connectionId: string,
+    opts: { port?: number; username?: string; secret?: string }
+  ): Promise<DesktopLaunch>
+  /** Closes a tunnel early; the external client window is left to the OS. */
+  desktopClose(tunnelId: string): Promise<void>
+  /** Opens the in-app desktop window (IronRDP in a WebView) for this
+   *  connection. The password is the RDP login, not the SSH one. */
+  desktopEmbedded(
+    connectionId: string,
+    opts: { port?: number; username?: string; password?: string; secret?: string }
+  ): Promise<DesktopEmbedded>
+  /** Called by the desktop window to get its proxy URL and login. */
+  desktopAttach(id: string): Promise<DesktopEmbeddedInfo | null>
+  desktopCloseEmbedded(id: string): Promise<void>
+
   sftpList(sessionId: string, path: string): Promise<SftpEntry[]>
   sftpHome(sessionId: string): Promise<string>
   sftpMkdir(sessionId: string, path: string): Promise<void>
@@ -466,6 +577,10 @@ export interface Api {
   agentAbort(sessionId: string): Promise<void>
   /** Drops the conversation but keeps the panel. */
   agentReset(sessionId: string): Promise<void>
+  /** Continues a saved conversation in this session: its events are replayed
+   *  into every window through `onAgentCleared`, and its messages become the
+   *  model's history. False when the tab is busy or the id is not this host's. */
+  agentResume(sessionId: string, connectionId: string, conversationId: string): Promise<boolean>
   /** Conversations saved for one connection, newest first. */
   agentHistory(connectionId: string): Promise<AgentConversationInfo[]>
   agentHistoryGet(id: string): Promise<AgentConversation | null>
@@ -493,6 +608,17 @@ export interface Api {
   updateReleasesUrl(): Promise<void>
   /** This build's version, as package.json says. */
   appVersion(): Promise<string>
+
+  /** Opens the picture picker. Null when the user cancels; otherwise the path to
+   *  save and the picture itself as a data URL, for an immediate preview. */
+  pickBackgroundImage(): Promise<{ path: string; data: string } | null>
+  /** The saved picture as a data URL, or null. Read on boot and after a change. */
+  backgroundImage(): Promise<string | null>
+
+  /** Writes the agent skill package (SKILL.md + CLI) into a folder the user
+   *  picks, for another AI client. Resolves to the created path, null if the
+   *  user cancels. */
+  exportSkill(): Promise<string | null>
 
   /** Absolute path of a dropped File; Electron keeps it out of the DOM. */
   pathForFile(file: File): string
@@ -536,9 +662,15 @@ export interface Api {
   /** Registers this window for a session's agent events and returns the
    *  transcript so far, so the new window starts filled in. */
   attachAgentWindow(sessionId: string): Promise<AgentEvent[]>
+  /** The transcript so far, without registering anything — for a window that is
+   *  already attached and has just been told to redraw. */
+  agentTranscript(sessionId: string): Promise<AgentEvent[]>
   /** Fired when the conversation is cleared anywhere, so every window showing
    *  it empties together. */
   onAgentCleared(cb: (sessionId: string) => void): () => void
+  /** The saved connections changed somewhere other than this window — today,
+   *  because the AI assistant wrote one. */
+  onStoreChanged(cb: () => void): () => void
   /** Closes the window this renderer lives in. Used by windows that are just
    *  a panel, where the header's X means "this window", not "hide the panel". */
   closeWindow(): Promise<void>
@@ -564,12 +696,21 @@ export type AgentEvent =
   /** Parked: nothing happens until the user answers. Answered cards are
    *  resolved by whoever clicked them; anything still open when `done` arrives
    *  was cancelled. */
-  | { kind: 'ask'; askId: string; name: string; detail: string; risk: string; why: string }
+  /** Parked: nothing happens until the user answers. Answered cards are
+   *  resolved by whoever clicked them; anything still open when `done` arrives
+   *  was cancelled. `settled` is set on the stored copy only, so a replayed
+   *  conversation does not offer buttons for a session that no longer exists. */
+  | { kind: 'ask'; askId: string; name: string; detail: string; risk: string; why: string; settled?: boolean }
   | { kind: 'error'; message: string }
+  /** The history was summarised because it outgrew the context window; `note`
+   *  is what the model was left with, shown folded so it can be checked. */
+  | { kind: 'compact'; note: string }
   | { kind: 'done' }
 
 /** One saved conversation. Deltas are not kept: every answer also arrives once,
- *  whole, so a stored transcript is the settled events only. */
+ *  whole, so a stored transcript is the settled events only. `messages` is the
+ *  model-side history — it is what reopening the conversation continues from,
+ *  because the events above have lost the tool-call pairing. */
 export interface AgentConversation {
   id: string
   connectionId: string
@@ -579,10 +720,14 @@ export interface AgentConversation {
   createdAt: number
   updatedAt: number
   events: AgentEvent[]
+  messages?: Msg[]
+  /** Whose dialect `messages` is written in (`provider|baseUrl|model`), so
+   *  reopening it after switching models starts over instead of 400ing. */
+  endpoint?: string
 }
 
 /** Identity only, for the history list. */
-export type AgentConversationInfo = Omit<AgentConversation, 'events'>
+export type AgentConversationInfo = Omit<AgentConversation, 'events' | 'messages'>
 
 export type SessionEvent =
   /** Main opened this one on its own (the CLI asked for it); the renderer's job is

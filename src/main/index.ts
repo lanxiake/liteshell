@@ -1,5 +1,5 @@
 import { chmodSync, copyFileSync, readFileSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { extname, join } from 'node:path'
 import {
   app,
   BrowserWindow,
@@ -23,6 +23,7 @@ import type {
   UpdateAsset
 } from '../shared/types'
 import { SshManager } from './ssh'
+import { DesktopManager } from './desktop'
 import { CliServer } from './cli-server'
 import { AgentRunner, clearSpill } from './agent'
 import * as history from './agenthistory'
@@ -32,7 +33,8 @@ import { importFinalshell } from './finalshell'
 import { setupPasswordless } from './passwordless'
 import { localInterfaces } from './localnet'
 import { checkForUpdate, downloadUpdate, installUpdate, RELEASES_URL } from './update'
-import { sshAlias } from './sshconfig'
+import { aliasFor } from './sshconfig'
+import { exportSkill } from './skill'
 import {
   addKey,
   duplicateConnection,
@@ -80,14 +82,54 @@ const agentLog = new Map<string, AgentEvent[]>()
 const agentWindows = new Map<string, Set<WebContents>>()
 let tray: Tray | null = null
 let manager: SshManager
+let desktop: DesktopManager | null = null
 let cli: CliServer | null = null
 let agent: AgentRunner | null = null
 /** Only true once the app is really leaving. Closing the window parks it in the
  *  tray instead, so the close handler has to tell the two apart. */
 let quitting = false
 
-function emit(ev: SessionEvent): void {
-  // A conversation dies with its tab. Its transcript describes a machine that is
+/**
+ * A picture as a data URL, or null. Capped: a 60 MB wallpaper dragged in by
+ * mistake would be re-sent over IPC on every launch, and this is a background,
+ * not a photo editor.
+ */
+const MAX_BG_BYTES = 12 * 1024 * 1024
+const MIME: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.bmp': 'image/bmp'
+}
+
+function readImage(path: string): string | null {
+  try {
+    const mime = MIME[extname(path).toLowerCase()]
+    if (!mime) return null
+    const data = readFileSync(path)
+    if (data.length > MAX_BG_BYTES) return null
+    return `data:${mime};base64,${data.toString('base64')}`
+  } catch {
+    // Moved or deleted since it was chosen: no background, not a broken window.
+    return null
+  }
+}
+
+/**
+ * What a window gets when it draws a session's conversation from scratch. A
+ * parked approval is always the last event, so every other card is a record:
+ * replaying one with live buttons would offer to approve a turn that is over.
+ */
+function replayable(sessionId: string): AgentEvent[] {
+  const log = agentLog.get(sessionId) ?? []
+  return log.map((ev, i) =>
+    ev.kind === 'ask' && i !== log.length - 1 ? { ...ev, settled: true } : ev
+  )
+}
+
+function emit(ev: SessionEvent): void {  // A conversation dies with its tab. Its transcript describes a machine that is
   // no longer connected, and its output handles point at nothing re-readable.
   if (ev.type === 'status' && (ev.status === 'closed' || ev.status === 'error')) {
     agent?.forget(ev.sessionId)
@@ -298,6 +340,40 @@ function registerIpc(): void {
   ipcMain.handle('session:disconnect', (_e, id: string) => manager.disconnect(id))
   ipcMain.handle('session:disconnectAll', () => manager.disconnectAll())
 
+  // Remote desktop goes through a tunnel of its own: the external client gets
+  // a loopback port, the remote RDP service stays unreachable from the network.
+  ipcMain.handle(
+    'desktop:open',
+    (_e, id: string, opts: { port?: number; username?: string; secret?: string }) =>
+      desktop!.open(id, opts)
+  )
+  ipcMain.handle('desktop:close', (_e, tunnelId: string) => desktop?.close(tunnelId))
+
+  // Embedded desktop: the main process owns the SSH tunnel and TLS-terminating
+  // RDCleanPath proxy; the window only runs the WASM client.
+  ipcMain.handle(
+    'desktop:openEmbedded',
+    async (
+      _e,
+      id: string,
+      opts: { port?: number; username?: string; password?: string; secret?: string }
+    ) => {
+      const opened = await desktop!.openEmbedded(id, opts)
+      try {
+        const w = createWindow({ desktop: opened.id }, true)
+        w.on('closed', () => desktop?.closeEmbedded(opened.id))
+      } catch (err) {
+        // The window never attached, so nothing else would close the SSH
+        // connection and the proxy.
+        desktop!.closeEmbedded(opened.id)
+        throw err
+      }
+      return opened
+    }
+  )
+  ipcMain.handle('desktop:attach', (_e, id: string) => desktop?.attachEmbedded(id) ?? null)
+  ipcMain.handle('desktop:closeEmbedded', (_e, id: string) => desktop?.closeEmbedded(id))
+
   // A renderer claims a session when it puts a terminal around it. Events are
   // routed to exactly one window, so moving a tab between windows is a move.
   ipcMain.handle('session:attach', (e, sessionId: string) => {
@@ -344,12 +420,9 @@ function registerIpc(): void {
       agentWindows.set(sessionId, set)
     }
     set.add(e.sender)
-    // A parked approval is always the last event: anything after it means it
-    // was answered, and a replayed card would be a button that does nothing.
-    return (agentLog.get(sessionId) ?? []).filter(
-      (ev, i, all) => ev.kind !== 'ask' || i === all.length - 1
-    )
+    return replayable(sessionId)
   })
+  ipcMain.handle('agent:transcript', (_e, sessionId: string) => replayable(sessionId))
 
   ipcMain.handle('sftp:home', (_e, id: string) => manager.home(id))
   ipcMain.handle('sftp:list', (_e, id: string, path: string) => manager.list(id, path))
@@ -458,6 +531,18 @@ function registerIpc(): void {
     // window it was clicked in only would leave the other one lying.
     for (const w of BrowserWindow.getAllWindows()) w.webContents.send('agent:cleared', sessionId)
   })
+  ipcMain.handle('agent:resume', (_e, sessionId: string, connectionId: string, id: string) => {
+    const events = agent?.resume(sessionId, connectionId, id)
+    if (!events) return false
+    // The replay for a popped-out window comes from here, so it has to hold
+    // what was just restored and not the conversation it replaced.
+    agentLog.set(sessionId, events)
+    // Every window showing this session has to redraw from scratch: there is
+    // no event that means "clear and replace". Each asks for the transcript
+    // back when it hears this.
+    for (const w of BrowserWindow.getAllWindows()) w.webContents.send('agent:cleared', sessionId)
+    return true
+  })
   ipcMain.handle('agent:history', (_e, connectionId: string) => history.list(connectionId))
   ipcMain.handle('agent:historyGet', (_e, id: string) => history.get(id))
   ipcMain.handle('agent:historyDelete', (_e, id: string) => history.remove(id))
@@ -519,18 +604,10 @@ function registerIpc(): void {
   ipcMain.handle('conn:passwordless', async (_e, id: string, secret?: string) => {
     const conn = store().connections.find((c) => c.id === id)
     if (!conn) throw new Error(`未知连接: ${id}`)
-    // The alias is the address unless another profile already claimed it, in
-    // which case this one gets the next letter. Assigned once and then stored
-    // so configuring twice does not walk it a letter down; re-derived when the
-    // address itself changed, because the name is supposed to be the address.
-    let alias = conn.sshAlias
-    if (!alias || !alias.startsWith(conn.host)) {
-      const taken = store()
-        .connections.filter((c) => c.id !== id && c.sshAlias)
-        .map((c) => c.sshAlias as string)
-      alias = sshAlias(conn.host, taken)
-      upsertConnection({ ...conn, sshAlias: alias }, null)
-    }
+    // Uniqueness is global: a name already held by any other profile — same
+    // folder or not — is re-derived instead of being written over.
+    const alias = aliasFor(conn, store().connections)
+    if (alias !== conn.sshAlias) upsertConnection({ ...conn, sshAlias: alias }, null)
     return setupPasswordless(conn, secret, alias)
   })
   ipcMain.handle('net:interfaces', () => localInterfaces())
@@ -617,6 +694,51 @@ function registerIpc(): void {
     })
     return picked.canceled ? null : (picked.filePaths[0] ?? null)
   })
+
+  /** One picture, inlined. The page's CSP has no `file:` in img-src and this is
+   *  the only reason to loosen it — a data URL keeps the renderer with no
+   *  filesystem reach at all. */
+  ipcMain.handle('theme:pickBackground', async (e) => {
+    const picked = await dialog.showOpenDialog(ownerOf(e.sender), {
+      title: '选择终端背景图片',
+      properties: ['openFile'],
+      filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp'] }]
+    })
+    const path = picked.canceled ? undefined : picked.filePaths[0]
+    if (!path) return null
+    const data = readImage(path)
+    if (!data) {
+      dialog.showMessageBox(ownerOf(e.sender), {
+        type: 'warning',
+        message: '这张图用不了',
+        detail: '支持 png / jpg / webp / gif / bmp，且不超过 12 MB。'
+      })
+      return null
+    }
+    return { path, data }
+  })
+  ipcMain.handle('theme:background', () => {
+    const path = store().settings.backgroundImage
+    return path ? readImage(path) : null
+  })
+  ipcMain.handle('skill:export', async (e) => {
+    const picked = await dialog.showOpenDialog(ownerOf(e.sender), {
+      title: '选择放技能包的目录',
+      buttonLabel: '导出到这里',
+      properties: ['openDirectory', 'createDirectory']
+    })
+    if (picked.canceled || !picked.filePaths[0]) return null
+    try {
+      return exportSkill(picked.filePaths[0])
+    } catch (err) {
+      dialog.showMessageBox(ownerOf(e.sender), {
+        type: 'error',
+        message: '导出失败',
+        detail: (err as Error).message
+      })
+      return null
+    }
+  })
 }
 
 app.setAppUserModelId('dev.lanxk.liteshell')
@@ -630,13 +752,17 @@ app.on('second-instance', showWindow)
 void app.whenReady().then(() => {
   if (!single) return
   manager = new SshManager(emit)
+  desktop = new DesktopManager()
   // Sessions the CLI opens get a tab too, so the user can watch the agent work —
   // and take over the moment it gets something wrong.
   cli = new CliServer(manager, (connectionId, sessionId) =>
     emit({ type: 'cli-session', sessionId, connectionId })
   )
   cli.listen()
-  agent = new AgentRunner(cli, emit)
+  // The agent can write the connection list too, out of band from this window.
+  agent = new AgentRunner(cli, emit, () => {
+    for (const w of BrowserWindow.getAllWindows()) w.webContents.send('store:changed')
+  })
   // Outputs spilled by the last run are scratch, and nothing outside this
   // process is expected to still hold a handle to them.
   clearSpill()
@@ -659,4 +785,5 @@ app.on('before-quit', () => {
   history.flush()
   cli?.close()
   manager?.disconnectAll()
+  desktop?.closeAll()
 })

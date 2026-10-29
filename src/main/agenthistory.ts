@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { app } from 'electron'
-import type { AgentConversation, AgentConversationInfo, AgentEvent } from '../shared/types'
+import type { AgentConversation, AgentConversationInfo, AgentEvent, Msg } from '../shared/types'
 
 /**
  * Saved AI conversations, one file beside the store rather than inside it: a
@@ -47,12 +47,31 @@ function schedule(): void {
   }, 800)
 }
 
+/** A saved conversation keeps its tool results, but only this much of each: a
+ *  build log is 32 KB a line in the live transcript, and 200 conversations of
+ *  that is a file nobody wants parsed on every save. The live copy is intact —
+ *  this only bounds what survives a restart. */
+const MAX_STORED_TEXT = 4000
+
+function slim(m: Msg): Msg {
+  if (m.role !== 'result') return m
+  return {
+    ...m,
+    results: m.results.map((r) =>
+      r.text.length > MAX_STORED_TEXT
+        ? { ...r, text: `${r.text.slice(0, MAX_STORED_TEXT)}\n…（存档只留了前 ${MAX_STORED_TEXT} 字）` }
+        : r
+    )
+  }
+}
+
 function persist(): void {
   const list = load()
   try {
     mkdirSync(dirname(file()), { recursive: true })
     const tmp = `${file()}.tmp`
-    writeFileSync(tmp, JSON.stringify(list), 'utf8')
+    const stored = list.map((c) => (c.messages ? { ...c, messages: c.messages.map(slim) } : c))
+    writeFileSync(tmp, JSON.stringify(stored), 'utf8')
     renameSync(tmp, file())
   } catch {
     // A full disk must not take the conversation down with it.
@@ -71,7 +90,7 @@ export function list(connectionId: string): AgentConversationInfo[] {
   return load()
     .filter((c) => c.connectionId === connectionId)
     .sort((a, b) => b.updatedAt - a.updatedAt)
-    .map(({ events: _events, ...rest }) => rest)
+    .map(({ events: _events, messages: _messages, endpoint: _endpoint, ...rest }) => rest)
 }
 
 export function get(id: string): AgentConversation | null {
@@ -95,11 +114,17 @@ const titleOf = (events: AgentEvent[]): string => {
 /**
  * Appends one event to the open conversation for a session, creating it on the
  * first user turn. Returns the conversation it went into.
+ *
+ * `messages` is the model-side history saved alongside, so reopening the
+ * conversation continues it instead of starting over. It is written on every
+ * event because it is a plain assignment; the file itself is debounced.
  */
 export function append(
   current: string | null,
   connectionId: string,
-  event: AgentEvent
+  event: AgentEvent,
+  messages?: Msg[],
+  endpoint?: string
 ): string {
   const list = load()
   let convo = current ? list.find((c) => c.id === current) : undefined
@@ -118,6 +143,16 @@ export function append(
   }
   if (event.kind !== 'delta') convo.events.push(event)
   if (convo.events.length > MAX_EVENTS) convo.events.splice(0, convo.events.length - MAX_EVENTS)
+  // A reopened conversation replays these events, and a card that still has
+  // buttons would approve a command whose turn ended long ago.
+  if (event.kind === 'done') {
+    for (const ev of convo.events) if (ev.kind === 'ask') ev.settled = true
+  }
+  // It is the writer's responsibility to hand over a list already inside the
+  // window: truncating here would cut a tool result away from its call and
+  // leave a history no endpoint will accept.
+  if (messages?.length) convo.messages = messages
+  if (endpoint) convo.endpoint = endpoint
   convo.updatedAt = Date.now()
   convo.title = convo.title || titleOf(convo.events)
 

@@ -98,6 +98,21 @@ for (const c of AUTO) {
 check('空命令不会被当成安全而放行 exec', !gate('exec', '').auto)
 check('mkdir/mv/rm 这些工具本身按命令判，不是一律弹卡', gate('mkdir', 'mkdir -p /tmp/x').auto)
 check('删除工具照旧要问', !gate('rm', 'rm /tmp/x').auto)
+// Transfers touch a file on one side or the other; neither direction is ever
+// silent, whatever the paths say.
+for (const tool of ['upload', 'download']) {
+  check(`${tool} 不自动执行`, !gate(tool).auto)
+  check(`${tool} 标成有风险`, gate(tool).risk === 'risky')
+}
+
+// Writing the client's own connection list never runs on its own: it is a
+// destination the shell classifier has no idea about, same as a transfer.
+for (const tool of ['save_connection', 'save_folder']) {
+  check(`${tool} 不自动执行`, !gate(tool, 'example.com').auto)
+  check(`${tool} 标成有风险`, gate(tool).risk === 'risky')
+}
+
+check('列连接只读、直接跑', gate('list_connections').auto)
 
 /* ---------- critical: no undo ---------- */
 

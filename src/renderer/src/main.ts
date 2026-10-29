@@ -447,6 +447,9 @@ interface Session {
 let store: Store
 let activeId: string | null = null
 let broadcast = false
+/** The chosen wallpaper as a data URL, fetch from main once on boot. Kept out of
+ *  the store: the path is saved, the bytes never are. */
+let bgDataUrl: string | null = null
 const sessions = new Map<string, Session>()
 const collapsed = new Set<string>()
 
@@ -462,6 +465,7 @@ async function boot(): Promise<void> {
       : 'win'
 
   store = await api.getStore()
+  bgDataUrl = store.settings.backgroundImage ? await api.backgroundImage() : null
   applySettings(store.settings)
 
   // ?agent=<session>&conn=<connection>: this window holds only the AI panel.
@@ -471,16 +475,31 @@ async function boot(): Promise<void> {
     await bootAgentWindow(onlyAgent, params.get('conn') ?? '')
     return
   }
+  // ?desktop=<id>: this window is one embedded remote desktop. Loaded on
+  // demand so the WASM chunk stays out of every other window.
+  const desktopId = params.get('desktop')
+  if (desktopId) {
+    const { bootDesktopWindow } = await import('./desktop')
+    await bootDesktopWindow(desktopId)
+    return
+  }
 
   renderTree()
   wireChrome()
   // Registered before attaching: main starts replaying buffered events the
   // moment the attach call lands.
   api.onSessionEvent(handleEvent)
-  api.onAgentCleared((sid) => {
+  api.onAgentCleared(async (sid) => {
     const session = sessions.get(sid)
-    if (session?.agent) clearAgentView(session.agent)
+    if (!session?.agent) return
+    clearAgentView(session.agent)
+    // A clear and a resume are the same broadcast — there is no event that
+    // means "replace". Asking for the transcript again is what tells them
+    // apart: after a clear it comes back empty.
+    for (const ev of await api.agentTranscript(sid)) renderAgent(session, ev)
   })
+  // The AI assistant can create and edit connections; the tree has to follow.
+  api.onStoreChanged(() => void refreshStore())
 
   // ?attach=<session>&conn=<connection>: this window was opened around a tab
   // that is already connected somewhere else.
@@ -513,8 +532,12 @@ async function bootAgentWindow(sessionId: string, connectionId: string): Promise
     if (replaying) queued.push(ev.event)
     else renderAgent(session, ev.event)
   })
-  api.onAgentCleared((sid) => {
-    if (sid === sessionId) clearAgentView(view)
+  api.onAgentCleared(async (sid) => {
+    if (sid !== sessionId) return
+    clearAgentView(view)
+    // Redrawn from main rather than from the event that caused it: a resume
+    // lands here with a full transcript, a clear with nothing.
+    for (const ev of await api.agentTranscript(sessionId)) renderAgent(session, ev)
   })
 
   const history = await api.attachAgentWindow(sessionId)
@@ -541,15 +564,54 @@ function applySettings(settings: Settings): void {
   document.documentElement.style.setProperty('--type-code', theme.term.cyan ?? '#39c5cf')
   document.body.dataset.theme = settings.theme
   void api.setWindowChrome(theme.ui.bg, theme.ui['text-dim'])
+  // A picture behind the text is only readable with a translucent background,
+  // so the two go together: the theme's own colour is written with the alpha
+  // the theme author picked (all of them are fully opaque), and this is the one
+  // place that overrides it.
+  const bg = terminalBackground(settings)
+  // The padding and the scrollbar gutter sit outside xterm's canvas, so they
+  // need the same colour the terminal is painting — or, with a picture, no
+  // colour at all so the image shows through to the edges.
+  document.body.style.setProperty('--term-picture', bg.picture)
+  document.body.style.setProperty('--term-bg', bg.picture === 'none' ? (theme.term.background ?? 'transparent') : 'transparent')
   for (const session of sessions.values()) {
     session.term.options.fontFamily = settings.fontFamily
     session.term.options.fontSize = settings.fontSize
     session.term.options.cursorStyle = settings.cursorStyle
     session.term.options.cursorBlink = settings.cursorBlink
     session.term.options.scrollback = settings.scrollback
-    session.term.options.theme = theme.term
+    session.term.options.theme = { ...theme.term, background: bg.color }
     session.fit.fit()
   }
+}
+
+/** How much of the theme's background survives over a picture. Low enough that
+ *  the image shows, high enough that a black-on-white wallpaper does not make
+ *  the text unreadable — this is the one knob that matters. */
+const PICTURE_ALPHA = 0.72
+
+/** Either the theme's plain background, or a translucent one plus the picture.
+ *  `backgroundImage` is the chosen file; the data URL comes from main, since the
+ *  page cannot read a path.
+ *
+ *  Written as rgba() rather than `color-mix()`: xterm parses the colour itself
+ *  and hands the string to a canvas, so it has to be something a canvas already
+ *  understands. */
+function terminalBackground(settings: Settings): { color?: string; picture: string } {
+  const theme = THEMES[settings.theme] ?? THEMES.liteshell
+  if (!settings.backgroundImage || !bgDataUrl) {
+    return { color: theme.term.background, picture: 'none' }
+  }
+  return { color: withAlpha(theme.term.background, PICTURE_ALPHA), picture: `url("${bgDataUrl}")` }
+}
+
+/** `#rrggbb` → `rgba(r, g, b, a)`. Anything else is handed back untouched: a
+ *  theme with an unusual colour is not a reason to break the whole terminal. */
+function withAlpha(color: string | undefined, alpha: number): string | undefined {
+  const m = /^#([0-9a-f]{6})$/i.exec(color ?? '')
+  if (!m) return color
+  const n = parseInt(m[1], 16)
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`
 }
 
 /* ------------------------------------------------------------------ *
@@ -738,6 +800,7 @@ function treeMenu(ev: MouseEvent, item: Folder | Connection, isFolder: boolean, 
       ]
     : [
         { label: '连接', run: () => void openSession(item as Connection) },
+        { label: '远程桌面 (RDP)…', run: () => void desktopDialog(item as Connection) },
         { label: '编辑', run: () => connDialog(item as Connection, null) },
         { label: '重命名', run: () => renameConnection(item as Connection) },
         { label: '复制 IP', run: () => copyText((item as Connection).host, 'IP') },
@@ -797,6 +860,144 @@ async function passwordlessDialog(conn: Connection): Promise<void> {
       { label: '好', primary: true, onClick: closeModal }
     ])
   }
+}
+
+/**
+ * Remote desktop is RDP on the remote's loopback, reached through an SSH
+ * tunnel. The SSH secret (if any) is the one LiteShell already knows how to
+ * ask for; the desktop's own password belongs to the RDP client.
+ */
+async function desktopDialog(conn: Connection): Promise<void> {
+  const picked = await withSecret(conn, '继续')
+  if (!picked) return
+
+  const port = input(String(conn.rdpPort ?? 3389), 'number')
+  port.min = '1'
+  port.max = '65535'
+  const username = input(conn.rdpUsername ?? conn.username)
+  const password = input('', 'password')
+  password.autocomplete = 'off'
+  const remember = el('input')
+  remember.type = 'checkbox'
+  remember.checked = true
+  const rememberRow = el('label', 'check-row')
+  rememberRow.append(remember, document.createTextNode('记住端口和用户名'))
+
+  const body = el('div')
+  body.style.display = 'grid'
+  body.style.gap = '10px'
+  body.append(
+    field('RDP 端口（远端 127.0.0.1）', port),
+    field('RDP 用户名', username),
+    field('RDP 密码（仅内嵌窗口使用，不保存）', password),
+    rememberRow,
+    el('div', 'mon-sub', '连接经 SSH 隧道转发：桌面服务不需要对网络开放，只需 sshd 可达。'),
+    el(
+      'div',
+      'mon-sub',
+      'Ubuntu 22.04+ 在「设置 → 系统 → 远程桌面」开启，默认端口 3389。内嵌窗口需要密码，密码只留在内存；系统客户端会自己询问。'
+    )
+  )
+
+  const readForm = (): { rdpPort: number; rdpUsername: string } | null => {
+    const rdpPort = Number(port.value)
+    if (!Number.isInteger(rdpPort) || rdpPort < 1 || rdpPort > 65535) {
+      port.focus()
+      return null
+    }
+    return { rdpPort, rdpUsername: username.value.trim() }
+  }
+
+  // The tunnel authenticating is proof the SSH password works, so a "remember"
+  // answer can be honoured without the terminal's retry.
+  const keepSecret = async (): Promise<void> => {
+    if (!picked.secret || !picked.remember) return
+    await persistSecret(picked.conn, picked.secret).catch((err: Error) =>
+      log('warn', `[${conn.name}] 密码保存失败：${err.message}`)
+    )
+  }
+
+  const keepPrefs = async (rdpPort: number, rdpUsername: string): Promise<void> => {
+    if (!remember.checked) return
+    const { hasSecret: _hasSecret, secret: _secret, ...rest } = conn
+    await api.saveConnection({ ...rest, rdpPort, rdpUsername: rdpUsername || undefined }, null)
+    await refreshStore()
+  }
+
+  const failed = (message: string): void => {
+    log('error', `[${conn.name}] 远程桌面启动失败：${message}`)
+    showModal('远程桌面启动失败', el('div', '', message), [
+      { label: '好', primary: true, onClick: closeModal }
+    ])
+  }
+
+  showModal(`远程桌面 — ${conn.name}`, body, [
+    { label: '取消', onClick: closeModal },
+    {
+      label: '系统客户端',
+      onClick: async () => {
+        const form = readForm()
+        if (!form) return
+        closeModal()
+        try {
+          const launched = await api.desktopOpen(conn.id, {
+            port: form.rdpPort,
+            username: form.rdpUsername,
+            secret: picked.secret
+          })
+          await keepSecret()
+          await keepPrefs(form.rdpPort, form.rdpUsername)
+          log(
+            'info',
+            `[${conn.name}] 远程桌面已启动：127.0.0.1:${launched.localPort} → 远端 127.0.0.1:${form.rdpPort}（${launched.client}）`
+          )
+          $('#status-text').textContent = `远程桌面：127.0.0.1:${launched.localPort}（${launched.client}）`
+          const info = el('div')
+          info.style.display = 'grid'
+          info.style.gap = '6px'
+          info.append(
+            el('div', '', `已通过 SSH 隧道启动 ${launched.client}`),
+            el(
+              'div',
+              'mon-sub',
+              `本机 127.0.0.1:${launched.localPort} → 远端 127.0.0.1:${form.rdpPort}`
+            ),
+            el('div', 'mon-sub', '桌面密码由 RDP 客户端询问；隧道在客户端退出时自动关闭。')
+          )
+          showModal('远程桌面已启动', info, [{ label: '好', primary: true, onClick: closeModal }])
+        } catch (err) {
+          failed((err as Error).message)
+        }
+      }
+    },
+    {
+      label: '内嵌打开',
+      primary: true,
+      onClick: async () => {
+        const form = readForm()
+        if (!form) return
+        const rdpPassword = password.value
+        closeModal()
+        try {
+          await api.desktopEmbedded(conn.id, {
+            port: form.rdpPort,
+            username: form.rdpUsername,
+            password: rdpPassword,
+            secret: picked.secret
+          })
+          await keepSecret()
+          await keepPrefs(form.rdpPort, form.rdpUsername)
+          log(
+            'info',
+            `[${conn.name}] 内嵌远程桌面已打开：远端 127.0.0.1:${form.rdpPort}（${form.rdpUsername}）`
+          )
+          $('#status-text').textContent = `内嵌远程桌面：${conn.name}`
+        } catch (err) {
+          failed((err as Error).message)
+        }
+      }
+    }
+  ])
 }
 
 async function exportOneDialog(conn: Connection): Promise<void> {
@@ -993,7 +1194,15 @@ function select(options: [string, string][], value: string): HTMLSelectElement {
 }
 
 async function refreshStore(): Promise<void> {
+  const before = store.settings.backgroundImage
   store = await api.getStore()
+  // A picture restored from a backup arrives as a path only, and the bytes are
+  // held here rather than in the store. Re-read them when the path changed —
+  // otherwise an imported wallpaper would stay invisible until a restart.
+  if (store.settings.backgroundImage !== before) {
+    bgDataUrl = store.settings.backgroundImage ? await api.backgroundImage() : null
+    applySettings(store.settings)
+  }
   renderTree()
   // Whether the AI panel exists is derived from the store, so every place that
   // reloads it has to resync — otherwise configuring a key would need a restart.
@@ -1244,7 +1453,38 @@ function settingsDialog(): void {
   const scrollback = input(String(s.scrollback), 'number')
   const copyOnSelect = select([['1', '开'], ['0', '关']], s.copyOnSelect ? '1' : '0')
 
-  const llm = s.llm ?? { provider: 'anthropic' as const, baseUrl: '', model: '', hasKey: false }
+  /* ---- terminal wallpaper ---- */
+  // A path in the store, the bytes only in memory: the file stays where the user
+  // put it, and nothing is copied into the app's data directory behind his back.
+  let bgPath = s.backgroundImage ?? ''
+  const bgBefore = { path: bgPath, data: bgDataUrl }
+  const bgRow = el('div', 'row-inline')
+  const bgName = el('span', 'mon-sub', bgPath ? baseName(bgPath) : '未设置')
+  bgName.title = bgPath
+  const bgPick = el('button', 'btn', '选择图片…')
+  const bgClear = el('button', 'agent-mini', '清除')
+  bgPick.addEventListener('click', () => {
+    void api.pickBackgroundImage().then((picked) => {
+      if (!picked) return
+      bgPath = picked.path
+      bgName.textContent = baseName(bgPath)
+      bgName.title = bgPath
+      // Shown at once, so the choice is judged against the real thing rather
+      // than a file name. Cancel puts the old one back (in the footer below).
+      bgDataUrl = picked.data
+      applySettings({ ...store.settings, backgroundImage: bgPath })
+    })
+  })
+  bgClear.addEventListener('click', () => {
+    bgPath = ''
+    bgName.textContent = '未设置'
+    bgName.title = ''
+    bgDataUrl = null
+    applySettings({ ...store.settings, backgroundImage: '' })
+  })
+  bgRow.append(bgPick, bgName, bgClear)
+
+  const llm = s.llm ?? { provider: 'anthropic' as const, baseUrl: '', model: '', hasKey: false, contextK: 128 }
   const provider = select(
     [
       ['anthropic', 'Anthropic（官方 SDK）'],
@@ -1338,6 +1578,12 @@ function settingsDialog(): void {
   })
   const apiKey = input('', 'password')
   apiKey.placeholder = llm.hasKey ? '已保存，留空则不修改' : '本地网关通常不用填'
+  // In K, exactly as written: the model's window is a number on a spec sheet,
+  // and asking for it in tokens is asking for one too many zeroes.
+  const context = input(String(llm.contextK ?? 128), 'number')
+  context.min = '8'
+  context.step = '8'
+  context.placeholder = '128'
   let forgetKey = false
   const forget = el('button', 'agent-mini', '清除')
   forget.title = '保存后删掉已存的密钥'
@@ -1370,12 +1616,29 @@ function settingsDialog(): void {
       grid.append(field('选中即复制', copyOnSelect))
       return grid
     })(),
+    field('终端背景图片', bgRow),
     el('div', 'field-sep', 'AI 助手'),
     field('接口', provider),
     field('接口地址', urlRow),
     field('模型', modelRow),
+    field('上下文窗口（K）', context),
     note,
     field('API Key', keyRow),
+    el('div', 'field-sep', '给别的 AI 客户端用'),
+    (() => {
+      const row = el('div', 'row-inline')
+      const btn = el('button', 'btn', '导出 CLI + 技能包')
+      btn.title = '把这个目录交给 Claude Code / Cline 等客户端，它们就能通过 LiteShell 操作服务器'
+      const note2 = el('span', 'mon-sub', '含 SKILL.md、CLI 和安装说明')
+      btn.addEventListener('click', () => {
+        void api.exportSkill().then((dir) => {
+          if (!dir) return
+          note2.textContent = `已导出到 ${dir}`
+        })
+      })
+      row.append(btn, note2)
+      return row
+    })(),
     el('div', 'field-sep', '更新'),
     (() => {
       const row = el('div', 'row-inline')
@@ -1389,7 +1652,15 @@ function settingsDialog(): void {
   )
 
   showModal('设置', body, [
-    { label: '取消', onClick: closeModal },
+    {
+      label: '取消',
+      onClick: () => {
+        // The picture was previewed live, before anything was saved.
+        bgDataUrl = bgBefore.data
+        applySettings({ ...store.settings, backgroundImage: bgBefore.path })
+        closeModal()
+      }
+    },
     {
       label: '保存',
       primary: true,
@@ -1413,12 +1684,14 @@ function settingsDialog(): void {
           sidebarCollapsed: s.sidebarCollapsed,
           // Not in this dialog; carried through so saving does not undo a drag.
           agentWidth: s.agentWidth,
+          backgroundImage: bgPath,
           llm: {
             provider: provider.value as Settings['llm']['provider'],
             baseUrl: baseUrl.value.trim(),
             model: model.value.trim(),
             // Absent means "leave the stored one alone"; empty means "forget it".
-            apiKey: forgetKey ? '' : apiKey.value.trim() || undefined
+            apiKey: forgetKey ? '' : apiKey.value.trim() || undefined,
+            contextK: Math.max(8, Math.round(Number(context.value) || 128))
           }
         }
         applySettings(await api.saveSettings(next))
@@ -2256,6 +2529,7 @@ async function openSession(rawConn: Connection, externalId?: string): Promise<vo
     return b
   }
 
+  const theme = THEMES[store.settings.theme] ?? THEMES.liteshell
   const term = new Terminal({
     fontFamily: store.settings.fontFamily,
     fontSize: store.settings.fontSize,
@@ -2263,7 +2537,14 @@ async function openSession(rawConn: Connection, externalId?: string): Promise<vo
     cursorBlink: store.settings.cursorBlink,
     scrollback: store.settings.scrollback,
     allowProposedApi: true,
-    theme: (THEMES[store.settings.theme] ?? THEMES.liteshell).term
+    // A wallpaper lives behind this terminal. Off, xterm paints its background
+    // opaque and the picture would only show in the padding.
+    allowTransparency: true,
+    // The same computed background applySettings() uses, not the theme's own:
+    // a tab opened while a picture is set has to be translucent from its first
+    // frame, otherwise xterm paints an opaque canvas over the wallpaper and the
+    // picture only appears after the next settings save.
+    theme: { ...theme.term, background: terminalBackground(store.settings).color }
   })
   const fit = new FitAddon()
   const search = new SearchAddon()
@@ -2279,9 +2560,9 @@ async function openSession(rawConn: Connection, externalId?: string): Promise<vo
   // this handle afterwards, for the rest of the session.
   sideGrip(files, 280, (w) => (files.style.flex = `0 0 ${w}px`))
   sideGrip(monitor.root, 300, (w) => (monitor.root.style.flex = `0 0 ${w}px`))
-  // The suggestion list is the last row of the pane on purpose: it opens *under*
-  // the prompt line like an IME candidate bar, and because it takes part in the
-  // flex layout it shrinks the terminal instead of covering what you were reading.
+  // The suggestion box is a floating overlay inside the pane, not a row of it:
+  // it is positioned by renderSuggest() over the output above the prompt so the
+  // terminal is never resized (and the prompt never jumps) when it appears.
   pane.append(toolbar, notice, searchBar, termRow, quickbar, suggest)
   $('#panes').appendChild(pane)
   term.open(termBox)
@@ -2342,6 +2623,9 @@ async function openSession(rawConn: Connection, externalId?: string): Promise<vo
   })
   new ResizeObserver(() => {
     if (activeId === sessionId) fit.fit()
+    // The overlay is placed in the pane's own coordinates, so a pane resize
+    // moves the row it was pinned to.
+    if (session.suggestItems.length) placeSuggest(session)
   }).observe(termBox)
 
   const agentBtn = tbtn('AI', 'agent', '用自然语言操作这台机器；只有会删数据、覆盖文件的命令才停下来问你', () =>
@@ -2352,7 +2636,7 @@ async function openSession(rawConn: Connection, externalId?: string): Promise<vo
   agentBtn.addEventListener('contextmenu', (ev) => {
     ev.preventDefault()
     ev.stopPropagation()
-    void agentHistoryDialog(session.connectionId)
+    void agentHistoryDialog(session.connectionId, { sessionId: session.id, view: session.agent! })
   })
 
   toolbar.append(
@@ -2448,6 +2732,7 @@ function tabMenu(ev: MouseEvent, session: Session): void {
   showMenu(ev.clientX, ev.clientY, [
     { label: '复制标签', run: () => conn && void openSession(conn) },
     { label: '连接', run: () => conn && void reconnectTab(session, conn) },
+    { label: '远程桌面 (RDP)…', run: () => conn && void desktopDialog(conn) },
     { label: '连接全部', run: () => void reconnectAllTabs() },
     { label: '断开', run: () => void api.disconnect(session.id) },
     { sep: true },
@@ -2695,6 +2980,9 @@ function handleEvent(ev: SessionEvent): void {
     // Keep a first-connection host key notice up so the fingerprint is actually readable.
     if (!session.notice.dataset.hostkey) session.notice.hidden = true
     $('#status-text').textContent = `${session.name} 已连接`
+    // Tab opened onto a live box: the panel is the point of the tab, so show it.
+    // Guarded by activeId so a background attach doesn't start polling unseen.
+    if (activeId === session.id) openMonitor(session)
   } else if (ev.status === 'error') {
     log('error', `[${session.name}] 连接失败：${ev.error ?? '未知错误'}`)
     session.notice.hidden = false
@@ -2716,11 +3004,8 @@ function handleEvent(ev: SessionEvent): void {
  * ------------------------------------------------------------------ */
 
 const HISTORY_LIMIT = 500
-/**
- * Five is what fits in the strip the popup occupies without the terminal having
- * to give up more than a few lines — see the .suggest rules in style.css, which
- * reserve exactly this many rows.
- */
+/** Five is what the floating box shows before it scrolls — see the .suggest
+ *  rules in style.css. */
 const SUGGEST_LIMIT = 5
 
 /** Everything the user types goes through here, so the history recorder sees it too. */
@@ -2795,6 +3080,37 @@ function buildSuggest(): HTMLElement {
   return box
 }
 
+/** Puts the box right under the row the cursor is on, so candidates read like
+ *  the next lines of what you are typing.
+ *
+ *  It is an overlay, not a row of the pane: nothing resizes when it appears
+ *  (no terminal re-layout, no pty resize, no prompt jumping up). When the
+ *  cursor is near the bottom there is no room underneath, so it flips above —
+ *  the same place the shell's own history would have put it. */
+function placeSuggest(session: Session): void {
+  const pane = session.pane.getBoundingClientRect()
+  const screen = session.term.element?.querySelector('.xterm-screen') as HTMLElement | null
+  if (!screen || !pane.height) return
+  const rect = screen.getBoundingClientRect()
+  const cell = rect.height / Math.max(1, session.term.rows)
+  const cursorTop = rect.top + session.term.buffer.active.cursorY * cell
+  const cursorBottom = cursorTop + cell
+
+  const box = session.suggest
+  // Anchored to the terminal, not the pane: with the file/monitor/AI panels
+  // open the pane is much wider than the screen the typing happens on.
+  box.style.left = `${Math.round(rect.left - pane.left + 4)}px`
+  box.style.maxWidth = `${Math.round(rect.width - 8)}px`
+
+  const gap = 2
+  const room = pane.bottom - cursorBottom - gap
+  // `max-height` caps the real height, so measure after the content is in.
+  const want = Math.min(box.scrollHeight + 10, 118)
+  const below = room >= want
+  const top = below ? cursorBottom + gap : Math.max(pane.top, cursorTop - gap - want)
+  box.style.top = `${Math.round(top - pane.top)}px`
+}
+
 function renderSuggest(session: Session): void {
   // The reverse-readline is the most fragile thing here, so keep the line it
   // currently believes in on the DOM where a debugger (or the smoke test) can
@@ -2814,9 +3130,17 @@ function renderSuggest(session: Session): void {
       row.append(el('span', 'suggest-cmd', item.cmd))
       row.append(el('span', 'suggest-desc', item.hint ?? ''))
       row.append(el('span', 'suggest-hint', i === session.suggestIndex ? 'Tab 补全 · Enter 执行' : ''))
+      // A click fills the line instead of sending: the box floats over the
+      // output now, so it has to be as safe to hit as Tab is.
+      row.addEventListener('mousedown', (ev) => {
+        ev.preventDefault()
+        applySuggest(session, item, false)
+        session.term.focus()
+      })
       return row
     })
   )
+  placeSuggest(session)
 }
 
 function hideSuggest(session: Session): void {
@@ -3006,6 +3330,8 @@ function buildFilePanel(session: Session): void {
   // The header belongs with the rows, not at the bottom of the panel.
   session.transferList.append(buildTransferHeader(session))
   session.files.append(head, pathbar, list)
+  // Transfers that started before this panel existed still deserve a row.
+  void api.sftpTransfers(session.id).then((list) => list.forEach((t) => renderTransfer(session, t)))
 }
 
 function parentOf(path: string): string {
@@ -3443,7 +3769,7 @@ function renderTransfer(session: Session, t: Transfer): void {
   if (!entry) {
     const row = el('div', 'xfer')
     const head = el('div', 'xfer-head')
-    head.append(el('span', 'xfer-name', t.name))
+    head.append(el('span', 'xfer-name', `${t.direction === 'download' ? '↓' : '↑'} ${t.name}`))
     const pct = el('span', 'xfer-pct', '0%')
     head.append(pct)
     const track = el('div', 'pbar')
@@ -3461,7 +3787,8 @@ function renderTransfer(session: Session, t: Transfer): void {
     t.state === 'failed' ? 'var(--danger)' : t.state === 'done' ? 'var(--ok)' : 'var(--accent)'
   entry.pct.textContent =
     t.state === 'failed' ? '失败' : t.state === 'done' ? '完成' : `${pct.toFixed(0)}%`
-  entry.row.title = t.state === 'failed' ? `${t.local} → ${t.remote}\n${t.error ?? ''}` : `${t.local} → ${t.remote}`
+  const [from, to] = t.direction === 'download' ? [t.remote, t.local] : [t.local, t.remote]
+  entry.row.title = t.state === 'failed' ? `${from} → ${to}\n${t.error ?? ''}` : `${from} → ${to}`
 
   session.transferList.style.display = 'flex'
   const header = session.transferList.querySelector('.xfer-head-bar')
@@ -3473,7 +3800,7 @@ function renderTransfer(session: Session, t: Transfer): void {
 
 function buildTransferHeader(session: Session): HTMLElement {
   const bar = el('div', 'xfer-head-bar')
-  bar.append(el('span', 'mon-title', '上传'), el('span', 'xfer-count', '0 项'))
+  bar.append(el('span', 'mon-title', '传输'), el('span', 'xfer-count', '0 项'))
   const clear = el('button', 'tbtn', '清除已完成')
   clear.addEventListener('click', async () => {
     await api.sftpClearTransfers(session.id)
@@ -3581,6 +3908,7 @@ interface MonitorView {
   netRows: Map<string, { name: HTMLElement; spark: HTMLCanvasElement; hist: number[]; rate: HTMLElement; total: HTMLElement }>
   gpu: HTMLElement
   disk: HTMLElement
+  proc: HTMLElement
   info: HTMLElement
   timer?: number
   busy: boolean
@@ -3611,6 +3939,20 @@ function buildMonitor(): MonitorView {
   // The header stays put while the readings scroll under it.
   const body = el('div', 'mon-body')
   root.append(body)
+
+  /** A titled block that folds away. Open state lives on the DOM node, so a poll
+   *  that only rewrites the body leaves it alone. */
+  const section = (title: string, open = true): HTMLElement => {
+    const box = el('div', 'mon-section')
+    const head = el('button', 'mon-title', title)
+    head.type = 'button'
+    const inner = el('div', 'mon-body')
+    box.classList.toggle('folded', !open)
+    head.addEventListener('click', () => box.classList.toggle('folded'))
+    box.append(head, inner)
+    body.append(box)
+    return inner
+  }
 
   // "Is anything wrong?" is the first question, so its answer goes on top.
   const alerts = el('div', 'mon-alerts')
@@ -3660,25 +4002,13 @@ function buildMonitor(): MonitorView {
   const netMeta = el('div', 'mon-line')
   netG.value.parentElement?.append(netMeta)
 
-  // Disks and GPUs first, network last: the network block is the one that
-  // grows a row per interface, so it belongs where the scroll ends.
-  const gpuBox = el('div', 'mon-section')
-  gpuBox.append(el('div', 'mon-title', 'GPU'))
-  const gpu = el('div', 'mon-body')
-  gpuBox.append(gpu)
-  body.append(gpuBox)
-
-  const diskBox = el('div', 'mon-section')
-  diskBox.append(el('div', 'mon-title', '磁盘'))
-  const disk = el('div', 'mon-body')
-  diskBox.append(disk)
-  body.append(diskBox)
-
-  const netBox = el('div', 'mon-section')
-  netBox.append(el('div', 'mon-title', '网络'))
-  const netList = el('div', 'mon-body')
-  netBox.append(netList)
-  body.append(netBox)
+  // The process table sits directly above the interface list, where the user
+  // can see which process is generating that traffic. Every titled block folds;
+  // all of them start open, so nothing moves for someone who never clicked one.
+  const gpu = section('GPU')
+  const disk = section('磁盘')
+  const procList = section('进程')
+  const netList = section('网络')
 
   return {
     root,
@@ -3692,6 +4022,7 @@ function buildMonitor(): MonitorView {
     netRows: new Map(),
     gpu,
     disk,
+    proc: procList,
     info,
     busy: false
   }
@@ -3846,6 +4177,31 @@ function renderMonitor(view: MonitorView, m: MonitorSnapshot): void {
     view.disk.append(row)
   }
 
+  view.proc.replaceChildren()
+  if (!m.proc.length) view.proc.append(el('div', 'mon-empty', '没有读到进程列表（ps 不可用）'))
+  for (const p of m.proc) {
+    const row = el('div', 'mon-proc')
+    // The command line is what makes a row identifiable — `java` alone names
+    // ten processes — so it gets the title and the hover tooltip.
+    row.title = `${p.cmd}\nPID ${p.pid} · ${p.user}\n磁盘 读 ${human(p.diskRead)} / 写 ${human(p.diskWrite)}` +
+      (p.path ? `\n${p.path}` : '')
+    const head = el('div', 'mon-proc-head')
+    head.append(el('span', 'mon-proc-pid', String(p.pid)))
+    head.append(el('span', 'mon-name', p.name))
+    head.append(el('span', `mon-val ${p.cpu >= 50 ? 'tone-warn' : ''}`, `${p.cpu.toFixed(1)}%`))
+    row.append(head)
+    const meta = el('div', 'mon-proc-meta')
+    meta.append(el('span', '', p.user))
+    meta.append(el('span', '', `内存 ${p.mem.toFixed(1)}% · ${human(p.rss)}`))
+    meta.append(el('span', '', `磁盘 ${human(p.diskRead + p.diskWrite)}`))
+    row.append(meta)
+    // Full path when the kernel lets us read it; otherwise the command line,
+    // which at least says where it was launched from.
+    const where = el('div', 'mon-proc-path', p.path || p.cmd)
+    row.append(where)
+    view.proc.append(row)
+  }
+
   const n = m.info
   view.info.replaceChildren(
     el('div', 'mon-host', n.hostname || '—'),
@@ -3888,18 +4244,29 @@ function stopMonitor(session: Session): void {
   if (session.monitor) session.monitor.timer = undefined
 }
 
+/** Idempotent, so both the toolbar and the first `ready` event can call it. */
+function openMonitor(session: Session): void {
+  const view = session.monitor
+  if (!view || view.root.style.display !== 'none') {
+    if (view) startMonitor(session)
+    return
+  }
+  view.root.style.display = 'flex'
+  session.toolbar.querySelector<HTMLElement>('[data-act="monitor"]')?.classList.add('on')
+  session.fit.fit()
+  startMonitor(session)
+}
+
 function toggleMonitor(session: Session): void {
   const view = session.monitor
   if (!view) return
-  const open = view.root.style.display !== 'none'
-  view.root.style.display = open ? 'none' : 'flex'
-  session.toolbar.querySelector<HTMLElement>('[data-act="monitor"]')?.classList.toggle('on', !open)
-  if (open) {
-    stopMonitor(session)
-  } else {
-    session.fit.fit()
-    startMonitor(session)
+  if (view.root.style.display === 'none') {
+    openMonitor(session)
+    return
   }
+  view.root.style.display = 'none'
+  session.toolbar.querySelector<HTMLElement>('[data-act="monitor"]')?.classList.remove('on')
+  stopMonitor(session)
 }
 
 /* ------------------------------------------------------------------ *
@@ -3932,11 +4299,15 @@ interface AgentView {
   compose: HTMLElement
   /** The bubble currently being streamed into, if any. */
   live: HTMLElement | null
+  /** The last settled answer, until a tool call turns it into preamble. */
+  lastAnswer: HTMLElement | null
   /** A card waiting for an answer. Whoever answers it clears this. */
   open: { askId: string; card: HTMLElement } | null
   busy: boolean
   /** The "requesting…" row, while the turn has said nothing yet. */
   working: HTMLElement | null
+  /** The tool step waiting for its `result`, if one is running. */
+  step: HTMLElement | null
   /** Panel header buttons: close this panel, or put the conversation in a window. */
   close: HTMLElement
   popout: HTMLElement
@@ -3980,7 +4351,12 @@ function buildAgent(standalone = false): AgentView {
   }
   past.addEventListener('click', () => {
     const cell = [...sessions.values()].find((s) => s.agent === view)
-    void agentHistoryDialog(cell?.connectionId ?? view.connectionId ?? '')
+    // A popped-out window has no Session in its map, so it hands over the ids
+    // it was opened with instead.
+    const target = cell
+      ? { sessionId: cell.id, view }
+      : { sessionId: view.sessionId ?? '', view }
+    void agentHistoryDialog(cell?.connectionId ?? view.connectionId ?? '', target)
   })
   root.append(head)
 
@@ -4045,9 +4421,11 @@ function buildAgent(standalone = false): AgentView {
     setup,
     compose,
     live: null,
+    lastAnswer: null,
     open: null,
     busy: false,
     working: null,
+    step: null,
     close,
     popout
   }
@@ -4228,16 +4606,49 @@ function agentHint(): HTMLElement {
 function clearAgentView(view: AgentView): void {
   view.log.replaceChildren(agentHint())
   view.live = null
+  view.lastAnswer = null
   view.open = null
+  view.step = null
   setAgentBusy(view, false)
 }
 
-function addAgentRow(view: AgentView, cls: string, text: string): HTMLElement {
+function addRow(view: AgentView, node: HTMLElement): void {
   view.log.querySelector('.agent-hint')?.remove()
-  const row = el('div', `agent-msg ${cls}`, text)
-  view.log.append(row)
+  view.log.append(node)
   view.log.scrollTop = view.log.scrollHeight
+}
+
+function addAgentRow(view: AgentView, cls: string, text: string): HTMLElement {
+  const row = el('div', `agent-msg ${cls}`, text)
+  addRow(view, row)
   return row
+}
+
+/** Outputs longer than a screenful fold away; a `df` should not. */
+function isLong(text: string): boolean {
+  return text.length > 600 || text.split('\n').length > 8
+}
+
+/** One tool call with its output folded underneath. The command and what it
+ *  printed are one event; two floating blocks never made that obvious, and
+ *  pairing them is what lets a transcript be read back like a log. */
+function agentStep(name: string, detail: string): HTMLElement {
+  const box = el('div', 'agent-step folded')
+  const head = el('button', 'agent-step-head', detail.startsWith(name) ? detail : `${name}  ${detail}`)
+  head.type = 'button'
+  const body = el('div', 'agent-step-body')
+  head.addEventListener('click', () => box.classList.toggle('folded'))
+  box.append(head, body)
+  return box
+}
+
+function fillAgentStep(step: HTMLElement, ok: boolean, text: string): void {
+  step.classList.toggle('bad', !ok)
+  const body = step.querySelector('.agent-step-body')
+  if (body) body.textContent = text || '（无输出）'
+  // Failures stay visible even when long: that output is the whole reason to
+  // look at the step, and a click is a tax on the one row that matters.
+  if (!isLong(text) || !ok) step.classList.remove('folded')
 }
 
 /** The settled answer: swap the streamed plain text for rendered Markdown. */
@@ -4272,6 +4683,8 @@ function renderAgent(session: Session, ev: AgentEvent): void {
       // It was appended before the message it is waiting on; the waiting row
       // belongs at the bottom of the transcript, not above the question.
       if (view.working) view.log.append(view.working)
+      // A new turn's preamble demotes its own text only, never the last answer.
+      view.lastAnswer = null
       break
     case 'delta': {
       if (!view.live) view.live = addAgentRow(view, 'assistant streaming', '')
@@ -4285,20 +4698,49 @@ function renderAgent(session: Session, ev: AgentEvent): void {
       // rendering it is idempotent for the normal case.
       if (!view.live) view.live = addAgentRow(view, 'assistant', '')
       settleAssistant(view.live, ev.text)
+      view.lastAnswer = view.live
       view.live = null
       break
     }
-    case 'tool':
+    case 'tool': {
+      // Text that a tool call follows is the model thinking out loud, not the
+      // answer. Demoting it here is what leaves one card per turn instead of
+      // four cards and four command blocks all shouting the same size.
+      view.lastAnswer?.classList.add('interim')
+      view.lastAnswer = null
       // The detail already reads as a command for most tools ("ls /", "mkdir /x"),
       // and repeating the tool name in front of it is just noise.
-      addAgentRow(view, 'tool', `▶ ${ev.detail.startsWith(ev.name) ? ev.detail : `${ev.name}  ${ev.detail}`}`)
+      const step = agentStep(ev.name, ev.detail)
+      view.step = step
+      addRow(view, step)
       break
+    }
     case 'result':
-      addAgentRow(view, ev.ok ? 'result' : 'result bad', ev.summary || '（无输出）')
+      if (view.step) {
+        fillAgentStep(view.step, ev.ok, ev.summary)
+        view.step = null
+      } else {
+        const step = agentStep(ev.name, ev.name)
+        fillAgentStep(step, ev.ok, ev.summary)
+        addRow(view, step)
+      }
       break
     case 'ask':
       addAgentAsk(view, ev)
       break
+    case 'compact': {
+      // Sits in the transcript like a tool step: it is something that happened
+      // to the conversation, and it is the only record of what was dropped.
+      view.step = null
+      const box = el('div', 'agent-step folded')
+      const head = el('button', 'agent-step-head', '早先的对话已压缩成摘要（点开看）')
+      head.type = 'button'
+      const body = el('div', 'agent-step-body', ev.note)
+      head.addEventListener('click', () => box.classList.toggle('folded'))
+      box.append(head, body)
+      addRow(view, box)
+      break
+    }
     case 'error':
       addAgentRow(view, 'error', ev.message)
       break
@@ -4307,6 +4749,7 @@ function renderAgent(session: Session, ev: AgentEvent): void {
       // button, a dropped connection, or an error.
       if (view.open) closeAgentAsk(view.open.card, '已取消')
       view.open = null
+      view.step = null
       // A stopped answer never gets its `assistant` event, so settle whatever
       // had streamed: the caret should stop blinking even on half a reply.
       if (view.live) settleAssistant(view.live, view.live.textContent ?? '')
@@ -4322,9 +4765,10 @@ function renderAgent(session: Session, ev: AgentEvent): void {
  *  the decision possible in the two seconds a person will actually spend. */
 function addAgentAsk(view: AgentView, ev: Extract<AgentEvent, { kind: 'ask' }>): void {
   const card = el('div', `agent-ask risk-${ev.risk}`)
-  // Only no-undo commands get here now, so the card is the one place that has
+  // Only no-undo actions get here now, so the card is the one place that has
   // to be read; the wording says what is about to be lost, not that it is a step.
-  card.append(el('div', 'agent-ask-why', `${ev.name} 会删改数据 — ${ev.why}`))
+  const lead = ev.name === 'upload' || ev.name === 'download' ? '要动文件' : '会删改数据'
+  card.append(el('div', 'agent-ask-why', `${ev.name} ${lead} — ${ev.why}`))
 
   // Editable only for shell commands: that is the only place a person knows
   // better than the model. Editing it re-runs the risk check.
@@ -4334,6 +4778,17 @@ function addAgentAsk(view: AgentView, ev: Extract<AgentEvent, { kind: 'ask' }>):
   box.rows = Math.min(14, Math.max(2, ev.detail.split('\n').length))
   box.readOnly = ev.name !== 'exec'
   card.append(box)
+
+  // A replayed conversation: the turn is over, so the card is a record. Drawn
+  // without buttons at all rather than disabled ones — a greyed-out "执行" next
+  // to a live command reads as "it is about to run".
+  if (ev.settled) {
+    card.classList.add('answered')
+    card.append(el('div', 'agent-ask-state', '已结束'))
+    view.log.append(card)
+    view.log.scrollTop = view.log.scrollHeight
+    return
+  }
 
   const row = el('div', 'agent-ask-btns')
   const deny = el('button', 'agent-btn', '拒绝')
@@ -4382,9 +4837,13 @@ function syncAgentEntry(session: Session): void {
  * saved conversations
  * ------------------------------------------------------------------ */
 
+/** Where a history entry can be continued: the live session and the panel that
+ *  shows it. Absent when there is nothing to continue into. */
+type ResumeTarget = { sessionId: string; view: AgentView }
+
 /** The list for one connection, newest first. A lid on the count, not a
  *  pager: past a few dozen, the export is the better way to read them. */
-async function agentHistoryDialog(connectionId: string): Promise<void> {
+async function agentHistoryDialog(connectionId: string, target?: ResumeTarget): Promise<void> {
   if (!connectionId) return
   const items = await api.agentHistory(connectionId)
   const list = el('div', 'hist-list')
@@ -4396,7 +4855,7 @@ async function agentHistoryDialog(connectionId: string): Promise<void> {
     const row = el('button', 'hist-item')
     row.append(el('span', 'hist-title', item.title || '未命名对话'))
     row.append(el('span', 'hist-when', when(item.updatedAt)))
-    row.addEventListener('click', () => void agentHistoryView(item.id))
+    row.addEventListener('click', () => void agentHistoryView(item.id, target))
     list.append(row)
   }
 
@@ -4409,65 +4868,131 @@ function when(ms: number): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
-/** One saved conversation, read-only: the approval cards are a record of what
- *  was asked, not buttons that would send something a session no longer backs. */
-async function agentHistoryView(id: string): Promise<void> {
+/** One saved conversation. Read-only in the archive view (the approval cards are
+ *  a record of what was asked), but resumable: «继续」 turns it back into the
+ *  live conversation of the session that reopened it. */
+async function agentHistoryView(id: string, target?: ResumeTarget): Promise<void> {
   const convo = await api.agentHistoryGet(id)
   if (!convo) return
   const view = el('div', 'agent-log history-view')
-  for (const ev of convo.events) view.append(...archiveRow(ev))
+  view.append(...archiveRows(convo.events))
   if (!view.childElementCount) view.append(el('div', 'mon-empty', '这段对话没有内容。'))
 
   const body = el('div', 'hist-body')
   body.append(view)
-  showModal(convo.title || 'AI 历史对话', body, [
-    { label: '返回', onClick: () => void agentHistoryDialog(convo.connectionId) },
+  const actions = [
+    { label: '返回', onClick: (): void => void agentHistoryDialog(convo.connectionId, target) },
     {
       label: '删除',
       danger: true,
-      onClick: async () => {
+      onClick: async (): Promise<void> => {
         await api.agentHistoryDelete(convo.id)
-        await agentHistoryDialog(convo.connectionId)
+        await agentHistoryDialog(convo.connectionId, target)
       }
     },
     {
       label: '导出',
-      primary: true,
-      onClick: async () => {
+      onClick: async (): Promise<void> => {
         const path = await api.agentHistoryExport(convo.id)
         if (path) log('info', `AI 对话已导出 → ${path}`)
         closeModal()
       }
-    }
-  ])
+    },
+    // Only with a live tab to continue in. The same panel in a popped-out
+    // window has a session id, which is what it hands back here.
+    ...(target
+      ? [
+          {
+            label: '继续这个对话',
+            primary: true,
+            onClick: (): void => void resumeAgentConversation(target, convo.id)
+          }
+        ]
+      : [])
+  ]
+  showModal(convo.title || 'AI 历史对话', body, actions)
 }
 
-function archiveRow(ev: AgentEvent): HTMLElement[] {
-  switch (ev.kind) {
-    case 'user':
-      return [el('div', 'agent-msg user', ev.files?.length ? `${ev.text}\n📎 ${ev.files.map(baseName).join('、')}` : ev.text)]
-    case 'assistant': {
-      const row = el('div', 'agent-msg assistant md')
-      row.append(renderMarkdown(ev.text))
-      return [row]
-    }
-    case 'tool':
-      return [el('div', 'agent-msg tool', `▶ ${ev.detail}`)]
-    case 'result':
-      return [el('div', `agent-msg result${ev.ok ? '' : ' bad'}`, ev.summary || '（无输出）')]
-    case 'ask': {
-      const card = el('div', `agent-ask risk-${ev.risk} answered`)
-      card.append(el('div', 'agent-ask-why', `${ev.name} — ${ev.why}`))
-      const cmd = el('pre', 'agent-ask-cmd', ev.detail)
-      cmd.setAttribute('readonly', '')
-      card.append(cmd)
-      return [card]
-    }
-    case 'error':
-      return [el('div', 'agent-msg error', ev.message)]
-    default:
-      return []
+/** Puts a saved conversation back in front of the model and on screen. The
+ *  transcript itself arrives through the cleared broadcast, like every other
+ *  redraw — this only has to say whether it worked. */
+async function resumeAgentConversation(target: ResumeTarget, id: string): Promise<void> {
+  const ok = await api.agentResume(target.sessionId, viewConnectionId(target), id)
+  if (!ok) {
+    closeModal()
+    log('warn', '这个标签页正在处理上一轮，等它结束再继续历史对话。')
+    return
   }
+  closeModal()
+  const view = target.view
+  if (view.root.style.display === 'none') {
+    const session = [...sessions.values()].find((s) => s.agent === view)
+    if (session) toggleAgent(session)
+  }
+  view.input.focus()
+}
+
+/** A panel knows its connection either through its Session or, in a popped-out
+ *  window, through the id it was opened with. */
+function viewConnectionId(target: ResumeTarget): string {
+  const session = [...sessions.values()].find((s) => s.agent === target.view)
+  return session?.connectionId ?? target.view.connectionId ?? ''
+}
+
+/** Same DOM as a live turn, minus anything that would answer a session that is
+ *  gone. Sharing the renderer is what keeps history and the panel identical. */
+function archiveRows(events: AgentEvent[]): HTMLElement[] {
+  const out: HTMLElement[] = []
+  let open: HTMLElement | null = null
+  let answer: HTMLElement | null = null
+  for (const ev of events) {
+    switch (ev.kind) {
+      case 'user':
+        out.push(el('div', 'agent-msg user', ev.files?.length ? `${ev.text}\n📎 ${ev.files.map(baseName).join('、')}` : ev.text))
+        break
+      case 'assistant': {
+        const row = el('div', 'agent-msg assistant md')
+        row.append(renderMarkdown(ev.text))
+        out.push(row)
+        answer = row
+        break
+      }
+      case 'tool':
+        // Same demotion as the live turn: text a tool call follows is preamble.
+        answer?.classList.add('interim')
+        answer = null
+        open = agentStep(ev.name, ev.detail)
+        out.push(open)
+        break
+      case 'result':
+        if (open) {
+          fillAgentStep(open, ev.ok, ev.summary)
+          open = null
+        } else {
+          const box = agentStep(ev.name, ev.name)
+          fillAgentStep(box, ev.ok, ev.summary)
+          out.push(box)
+        }
+        break
+      case 'ask': {
+        const lead = ev.name === 'upload' || ev.name === 'download' ? '要动文件' : '会删改数据'
+        const card = el('div', `agent-ask risk-${ev.risk} answered`)
+        card.append(el('div', 'agent-ask-why', `${ev.name} ${lead} — ${ev.why}`))
+        const cmd = el('pre', 'agent-ask-cmd', ev.detail)
+        cmd.setAttribute('readonly', '')
+        card.append(cmd)
+        out.push(card)
+        break
+      }
+      case 'error':
+        out.push(el('div', 'agent-msg error', ev.message))
+        break
+      case 'compact':
+        out.push(el('div', 'agent-msg compact', `早先的对话已压缩成摘要：\n${ev.note}`))
+        break
+    }
+  }
+  return out
 }
 
 function toggleAgent(session: Session): void {

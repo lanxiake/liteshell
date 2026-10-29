@@ -45,6 +45,37 @@ export const sshAlias = (host: string, taken: Iterable<string> = []): string => 
   for (let i = 2; ; i++) if (!used.has(`${base}-${i}`)) return `${base}-${i}`
 }
 
+/** Who else may be holding a name. Deliberately not `SshHost`: an alias is
+ *  assigned from the profile list, and that list has no port/username here. */
+export interface AliasOwner {
+  id: string
+  host: string
+  sshAlias?: string
+}
+
+/**
+ * The alias this profile should own *right now*, judged against every profile
+ * in the store — not just the ones in the same folder, which is how two
+ * connections on one address ended up writing the same `Host` block and
+ * quietly replacing each other.
+ *
+ * A stored alias is kept when nothing else claims it, so reconfiguring does not
+ * walk it a letter down; a copy or an import that inherited one gets its own.
+ */
+export function aliasFor(self: AliasOwner, all: Iterable<AliasOwner>): string {
+  const used = new Set<string>()
+  for (const c of all) {
+    if (c.id === self.id || !c.sshAlias) continue
+    used.add(c.sshAlias)
+  }
+  const keep = self.sshAlias?.trim()
+  const host = self.host.trim()
+  // `startsWith` also drops a stale alias when the address itself changed: the
+  // name is supposed to be the address, with a suffix only to break a tie.
+  if (keep && keep.startsWith(host) && !used.has(keep)) return keep
+  return sshAlias(host, used)
+}
+
 const blockStart = (key: string): string => `# >>> LiteShell: ${key} >>>`
 const blockEnd = (key: string): string => `# <<< LiteShell: ${key} <<<`
 

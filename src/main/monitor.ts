@@ -1,4 +1,4 @@
-import type { CpuCore, GpuInfo, MonitorSnapshot, NetCounter, NetIface } from '../shared/types'
+import type { CpuCore, GpuInfo, MonitorSnapshot, NetCounter, NetIface, ProcInfo } from '../shared/types'
 
 /**
  * Resource sampling for Linux hosts, in the spirit of what FinalShell scrapes:
@@ -24,6 +24,16 @@ export const MONITOR_SCRIPT = [
   'echo "@@LOAD"',
   'cat /proc/loadavg 2>/dev/null',
   'cat /proc/uptime 2>/dev/null',
+  'echo "@@PROC"',
+  // Busiest first, ten rows: this table is for spotting the process that is
+  // eating the box, not for a complete listing. `|` is the field separator, and
+  // the command line is last so it may contain anything.
+  'ps -ww -eo pid=,user=,pcpu=,pmem=,rss=,comm=,args= --sort=-pcpu 2>/dev/null | head -n 10 | while read -r pid user pcpu pmem rss comm args; do',
+  '  rd=0; wr=0',
+  '  while read -r k v; do case "$k" in read_bytes:) rd=$v;; write_bytes:) wr=$v;; esac; done < /proc/$pid/io 2>/dev/null',
+  '  exe=$(readlink /proc/$pid/exe 2>/dev/null)',
+  '  echo "$pid|$user|$pcpu|$pmem|$rss|$rd|$wr|$comm|$exe|$args"',
+  'done',
   'echo "@@INFO"',
   // Labelled so the parser does not depend on `nproc` existing or on line order.
   'echo "hostname=$(hostname 2>/dev/null)"',
@@ -52,6 +62,7 @@ const EMPTY = {
   netTotals: [],
   disk: [],
   gpu: [],
+  proc: [],
   uptime: 0,
   info: { hostname: '', os: '', kernel: '', arch: '', cpuModel: '' }
 }
@@ -118,6 +129,7 @@ export function parseMonitor(raw: string, at = Date.now()): MonitorSnapshot {
     netTotals: [],
     disk: [],
     gpu: [],
+    proc: [],
     at
   }
 
@@ -217,6 +229,27 @@ export function parseMonitor(raw: string, at = Date.now()): MonitorSnapshot {
       memTotal: num(cols[3]) * 1024 * 1024,
       temp: num(cols[4])
     } satisfies GpuInfo)
+  }
+
+  /* --- processes: `pid|user|cpu|mem|rss|read|write|comm|exe|args` ---
+     `exe` is empty for another user's process without CAP_SYS_PTRACE, and the
+     command line is the honest fallback in that case. */
+  for (const line of sections.PROC ?? []) {
+    const [pid, user, pcpu, pmem, rss, rd, wr, comm, exe, ...rest] = line.split('|')
+    if (!/^\d+$/.test((pid ?? '').trim())) continue
+    const args = rest.join('|').trim()
+    snapshot.proc.push({
+      pid: Number(pid),
+      user: (user ?? '').trim() || '?',
+      cpu: num(pcpu),
+      mem: num(pmem),
+      rss: num(rss) * 1024,
+      diskRead: num(rd) * 1024,
+      diskWrite: num(wr) * 1024,
+      name: (comm ?? '').trim() || args.split(/\s+/)[0] || `pid ${pid}`,
+      cmd: args || (comm ?? '').trim(),
+      path: (exe ?? '').trim() || undefined
+    } satisfies ProcInfo)
   }
 
   return snapshot

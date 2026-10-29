@@ -11,6 +11,15 @@ files:
   - package.json
   # The window icon on Linux (Windows uses the exe icon instead).
   - build/icon.png
+  # MIT notices for the bundled code, including the vendored RDP proxy.
+  - LICENSE
+  - THIRD-PARTY-NOTICES.md
+
+# The agent skill is copied out of the app by 「导出 CLI + 技能包」, so it has to
+# sit beside app.asar as real files rather than be packed into it.
+extraResources:
+  - from: skills/liteshell
+    to: skills/liteshell
 
 compression: maximum
 electronLanguages:

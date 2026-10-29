@@ -24,11 +24,17 @@ const api: Api = {
   resize: (id, cols, rows) => ipcRenderer.invoke('session:resize', id, cols, rows),
   disconnect: (id) => ipcRenderer.invoke('session:disconnect', id),
   disconnectAll: () => ipcRenderer.invoke('session:disconnectAll'),
+  desktopOpen: (id, opts) => ipcRenderer.invoke('desktop:open', id, opts),
+  desktopClose: (tunnelId) => ipcRenderer.invoke('desktop:close', tunnelId),
+  desktopEmbedded: (id, opts) => ipcRenderer.invoke('desktop:openEmbedded', id, opts),
+  desktopAttach: (id) => ipcRenderer.invoke('desktop:attach', id),
+  desktopCloseEmbedded: (id) => ipcRenderer.invoke('desktop:closeEmbedded', id),
   attachSession: (id) => ipcRenderer.invoke('session:attach', id),
   releaseSession: (id) => ipcRenderer.invoke('session:release', id),
   popOutSession: (id, connectionId) => ipcRenderer.invoke('session:popOut', id, connectionId),
   popOutAgent: (sessionId, connectionId) => ipcRenderer.invoke('agent:popOut', sessionId, connectionId),
   attachAgentWindow: (sessionId) => ipcRenderer.invoke('agent:attachWindow', sessionId),
+  agentTranscript: (sessionId) => ipcRenderer.invoke('agent:transcript', sessionId),
 
   sftpList: (id, path) => ipcRenderer.invoke('sftp:list', id, path),
   sftpHome: (id) => ipcRenderer.invoke('sftp:home', id),
@@ -57,6 +63,7 @@ const api: Api = {
   agentAbort: (sessionId) => ipcRenderer.invoke('agent:abort', sessionId),
   listModels: (cfg) => ipcRenderer.invoke('llm:models', cfg),
   agentReset: (sessionId) => ipcRenderer.invoke('agent:reset', sessionId),
+  agentResume: (sessionId, connectionId, id) => ipcRenderer.invoke('agent:resume', sessionId, connectionId, id),
   agentHistory: (connectionId) => ipcRenderer.invoke('agent:history', connectionId),
   agentHistoryGet: (id) => ipcRenderer.invoke('agent:historyGet', id),
   agentHistoryDelete: (id) => ipcRenderer.invoke('agent:historyDelete', id),
@@ -66,6 +73,10 @@ const api: Api = {
 
   // Dropped File objects carry no path in the renderer; only the main process can see it.
   pathForFile: (file) => webUtils.getPathForFile(file),
+
+  pickBackgroundImage: () => ipcRenderer.invoke('theme:pickBackground'),
+  backgroundImage: () => ipcRenderer.invoke('theme:background'),
+  exportSkill: () => ipcRenderer.invoke('skill:export'),
 
   pickFile: (filters) => ipcRenderer.invoke('dialog:pickFile', filters),
   importFinalshell: () => ipcRenderer.invoke('import:finalshell'),
@@ -81,6 +92,12 @@ const api: Api = {
     const handler = (_e: unknown, id: string): void => cb(id)
     ipcRenderer.on('agent:cleared', handler)
     return () => ipcRenderer.removeListener('agent:cleared', handler)
+  },
+
+  onStoreChanged: (cb) => {
+    const handler = (): void => cb()
+    ipcRenderer.on('store:changed', handler)
+    return () => ipcRenderer.removeListener('store:changed', handler)
   },
 
   closeWindow: () => ipcRenderer.invoke('window:close'),
