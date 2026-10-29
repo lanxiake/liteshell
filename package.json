@@ -1,6 +1,6 @@
 {
   "name": "liteshell",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Lightweight, fast, cross-platform SSH / SFTP terminal",
   "author": "lanxk",
   "license": "MIT",

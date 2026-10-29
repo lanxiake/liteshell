@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import { app, shell } from 'electron'
+import { app, net, shell } from 'electron'
 import type { UpdateAsset, UpdateCheck } from '../shared/types'
 
 /** The repository the releases are published from — the same one the app's
@@ -61,12 +61,36 @@ export function pickAsset(
   return { name: hit.name, url: hit.browser_download_url, size: hit.size ?? 0 }
 }
 
+/** Why a network call failed, in words the person reading the dialog can act
+ *  on. Node's fetch hides everything behind "fetch failed"; the cause carries
+ *  the code. */
+function describe(err: unknown): string {
+  const e = err as { name?: string; message?: string; cause?: { code?: string; message?: string } }
+  if (e?.name === 'TimeoutError') return '连接 GitHub 超时'
+  return e?.cause?.code ?? e?.cause?.message ?? e?.message ?? String(err)
+}
+
+/**
+ * Electron's network stack, not Node's `fetch`: it follows the system proxy.
+ * On a machine behind a local proxy (127.0.0.1:10808 and friends) Node's fetch
+ * goes direct, and the release-asset host then resets the connection mid-body
+ * — which surfaces as a bare `TypeError: fetch failed` after an update was
+ * found. The Chromium stack downloads the same file fine.
+ */
+async function get(url: string, init: RequestInit): Promise<Response> {
+  try {
+    return await net.fetch(url, init)
+  } catch (err) {
+    throw new Error(`${describe(err)}（如果这台机器靠代理上网，请确认系统代理已开启）`)
+  }
+}
+
 /** Asks GitHub for the latest published release. No token: this is a public
  *  repository, and shipping one inside the app would be a credential in a file
  *  anyone can read. */
 export async function checkForUpdate(current = app.getVersion()): Promise<UpdateCheck> {
   try {
-    const res = await fetch(`https://api.github.com/repos/${REPO}/releases/latest`, {
+    const res = await get(`https://api.github.com/repos/${REPO}/releases/latest`, {
       headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'LiteShell-updater' },
       signal: AbortSignal.timeout(15_000)
     })
@@ -99,8 +123,7 @@ export async function checkForUpdate(current = app.getVersion()): Promise<Update
       asset: picked ? { ...picked, sha256: digest?.browser_download_url } : null
     }
   } catch (err) {
-    const message = (err as Error)?.name === 'TimeoutError' ? '连接 GitHub 超时' : (err as Error).message
-    return { kind: 'error', message }
+    return { kind: 'error', message: describe(err) }
   }
 }
 
@@ -122,7 +145,7 @@ export async function downloadUpdate(
   const dir = mkdtempSync(join(tmpdir(), 'liteshell-update-'))
   const target = join(dir, basename(asset.name))
 
-  const res = await fetch(asset.url, {
+  const res = await get(asset.url, {
     headers: { 'User-Agent': 'LiteShell-updater' },
     redirect: 'follow',
     signal: AbortSignal.timeout(30 * 60_000)
@@ -139,7 +162,7 @@ export async function downloadUpdate(
   await pipeline(body, createWriteStream(target))
 
   if (asset.sha256) {
-    const expected = digestOf(await (await fetch(asset.sha256, { signal: AbortSignal.timeout(15_000) })).text())
+    const expected = digestOf(await (await get(asset.sha256, { signal: AbortSignal.timeout(15_000) })).text())
     const actual = createHash('sha256').update(await readFile(target)).digest('hex')
     if (expected && expected !== actual) throw new Error('下载的文件和发布方的校验值对不上，已丢弃')
   }
