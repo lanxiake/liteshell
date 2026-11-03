@@ -13,6 +13,7 @@ import {
 } from './commands'
 import { alertsFor, toneOf, usePct, type Tone } from './alerts'
 import { renderMarkdown } from './markdown'
+import { PRESETS, presetFor } from '../../shared/presets'
 import type {
   AgentEvent,
   Connection,
@@ -528,7 +529,12 @@ async function bootAgentWindow(sessionId: string, connectionId: string): Promise
   let replaying = true
   const queued: AgentEvent[] = []
   api.onSessionEvent((ev) => {
-    if (ev.type !== 'agent' || ev.sessionId !== sessionId) return
+    if (ev.sessionId !== sessionId) return
+    if (ev.type === 'agent-convo') {
+      view.root.dataset.convo = ev.conversationId
+      return
+    }
+    if (ev.type !== 'agent') return
     if (replaying) queued.push(ev.event)
     else renderAgent(session, ev.event)
   })
@@ -623,9 +629,86 @@ function withAlpha(color: string | undefined, alpha: number): string | undefined
  *  because the pointer landed on a name. */
 let selectedId: string | null = null
 
+/** What the sidebar's search box is filtering by. Empty = show the tree.
+ *  Kept outside renderTree because the input lives in the fixed header and
+ *  re-rendering the tree must not rebuild it (that would drop focus). */
+let treeQuery = ''
+
+/** One flat list of matches: name, host/IP, username and port all count, so
+ *  "10.0" finds a host and "root" finds everything logged in as root. Folder
+ *  names match too, and pulling in a folder's connections is what makes the
+ *  folder itself findable. */
+function filterTree(query: string): Connection[] {
+  const q = query.trim().toLowerCase()
+  if (!q) return []
+  const folders = new Set<string>()
+  for (const f of store.folders) if (f.name.toLowerCase().includes(q)) folders.add(f.id)
+  // A folder match should include what is under it, not just its own row.
+  for (let grew = true; grew; ) {
+    grew = false
+    for (const f of store.folders) {
+      if (f.parentId && folders.has(f.parentId) && !folders.has(f.id)) {
+        folders.add(f.id)
+        grew = true
+      }
+    }
+  }
+  const hit = (c: Connection): boolean =>
+    folders.has(c.folderId ?? '') ||
+    [c.name, c.host, c.username, String(c.port)].some((v) => v?.toLowerCase().includes(q))
+  return store.connections.filter(hit)
+}
+
+/** Search results as a flat list, newest state first. Rows are the same nodes
+ *  the tree draws — open on double click, menu on right click — so a found
+ *  connection behaves exactly like one found by scrolling. */
+function renderTreeSearch(tree: HTMLElement, query: string): void {
+  const found = filterTree(query)
+  if (!found.length) {
+    tree.append(el('div', 'empty-hint', `没有匹配「${query.trim()}」的连接`))
+    return
+  }
+  const label = el('div', 'side-sub', `${found.length} 个匹配`)
+  tree.append(label)
+  for (const conn of found) {
+    const node = el('div', 'node search-hit')
+    node.dataset.id = conn.id
+    node.dataset.kind = 'connection'
+    if (conn.id === selectedId) node.classList.add('sel')
+    if ([...sessions.values()].some((s) => s.connectionId === conn.id && s.status === 'ready')) {
+      node.classList.add('live')
+    }
+    node.append(el('span', 'dot'), el('span', 'label', conn.name))
+    node.append(el('span', 'sub', `${conn.username}@${conn.host}`))
+    node.addEventListener('click', () => {
+      selectedId = conn.id
+      tree.querySelectorAll('.node.sel').forEach((n) => n.classList.remove('sel'))
+      node.classList.add('sel')
+    })
+    // Keyboard parity with the search box: Tab reaches a row, Enter opens it.
+    node.tabIndex = 0
+    node.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault()
+        void openSession(conn)
+      }
+    })
+    node.addEventListener('dblclick', () => void openSession(conn))
+    node.addEventListener('contextmenu', (ev) => {
+      ev.preventDefault()
+      selectedId = conn.id
+      tree.querySelectorAll('.node.sel').forEach((n) => n.classList.remove('sel'))
+      node.classList.add('sel')
+      treeMenu(ev, conn, false, conn.id)
+    })
+    tree.append(node)
+  }
+}
+
 function renderTree(): void {
   const tree = $('#tree')
   tree.replaceChildren()
+  if (treeQuery.trim()) return renderTreeSearch(tree, treeQuery)
 
   const children = (parentId: string | null): (Folder | Connection)[] => [
     ...store.folders.filter((f) => f.parentId === parentId),
@@ -1485,31 +1568,56 @@ function settingsDialog(): void {
   bgRow.append(bgPick, bgName, bgClear)
 
   const llm = s.llm ?? { provider: 'anthropic' as const, baseUrl: '', model: '', hasKey: false, contextK: 128 }
+
+  /* ---- AI assistant: vendor, then the three fields that matter ---- */
+  // The vendor row is a set of presets, not a free-form list: picking one fills
+  // in the address and a short model list, which is what turns "填三个框"
+  // into one click. Everything stays editable underneath — a gateway nobody
+  // listed is "自定义".
   const provider = select(
     [
-      ['anthropic', 'Anthropic（官方 SDK）'],
-      ['openai', 'OpenAI 兼容（OpenAI / DeepSeek / 自建网关）']
+      ['anthropic', 'Anthropic（官方协议）'],
+      ['openai', 'OpenAI 兼容']
     ],
     llm.provider
   )
+  const vendor = select(
+    PRESETS.filter((p) => p.kind === llm.provider).map((p) => [p.id, p.label]),
+    (presetFor(llm.provider, llm.baseUrl) ?? PRESETS.find((p) => p.kind === llm.provider))?.id ?? 'custom'
+  )
+  // One note line under the form: what the preset is, then what the last
+  // pull/test said. Two of them stack up and the second reads like a footnote.
+  const note = el('div', 'llm-note')
+  const vendorNote = note
   const model = input(llm.model)
   const baseUrl = input(llm.baseUrl)
-  const MODEL: Record<string, string> = { anthropic: 'claude-opus-5', openai: 'deepseek-chat' }
+  const MODEL: Record<string, string> = { anthropic: 'claude-opus-5', openai: 'deepseek-flash' }
 
   // Names come from the endpoint itself; typing one from memory is how people
   // end up with a 404 that looks like a broken key. The list is a datalist, so
-  // picking is optional and typing still works when the lookup fails.
+  // picking is optional and typing still works when the lookup fails. It is
+  // seeded from the vendor preset and replaced by whatever "拉取模型" returns.
   const modelList = document.createElement('datalist')
   modelList.id = 'llm-models'
   model.setAttribute('list', modelList.id)
   model.autocomplete = 'off'
+  const fillList = (ids: string[]): void => {
+    modelList.replaceChildren(
+      ...ids.map((id) => {
+        const opt = document.createElement('option')
+        opt.value = id
+        return opt
+      })
+    )
+  }
   const pull = el('button', 'agent-mini', '拉取模型')
   pull.title = '从接口地址读取模型列表；读不到就直接手填'
-  const note = el('div', 'llm-note')
+  const test = el('button', 'agent-mini', '测试连接')
+  test.title = '带着工具列表真发一条「你好」，看这个地址/密钥/模型能不能用'
   const urlRow = el('div', 'key-row')
   urlRow.append(baseUrl, pull)
   const modelRow = el('div', 'key-row')
-  modelRow.append(model, modelList)
+  modelRow.append(model, test, modelList)
 
   const short = (err: unknown): string =>
     String((err as Error)?.message ?? err)
@@ -1517,35 +1625,29 @@ function settingsDialog(): void {
       .replace(/^Error:\s*/, '')
 
   pull.addEventListener('click', () => {
-    const ids = (base: string): Promise<string[]> =>
-      api.listModels({
-        provider: provider.value as Settings['llm']['provider'],
-        baseUrl: base,
-        apiKey: apiKey.value.trim() || undefined
-      })
+    const ids = (base: string, key: string | undefined, kind: Settings['llm']['provider']): Promise<string[]> =>
+      api.listModels({ provider: kind, baseUrl: base, apiKey: key })
     const fill = (list: string[]): void => {
-      modelList.replaceChildren(
-        ...list.map((id) => {
-          const opt = document.createElement('option')
-          opt.value = id
-          return opt
-        })
-      )
+      fillList(list)
       if (!model.value.trim()) model.value = list[0]
     }
 
     pull.disabled = true
     note.textContent = '正在拉取…'
-    const typed = baseUrl.value.trim().replace(/\/+$/, '')
-    ids(typed)
+    // Whatever is in the boxes right now wins: the point is to try what is
+    // typed, not what was saved yesterday.
+    const typedBase = baseUrl.value.trim().replace(/\/+$/, '')
+    const typedKey = apiKey.value.trim() || undefined
+    const typedProvider = provider.value as Settings['llm']['provider']
+    ids(typedBase, typedKey, typedProvider)
       .catch((err) => {
         // `/v1` is the single most common thing people leave off, and the
         // gateway answers a request to the bare host with its web page rather
         // than an error — so try the fixed-up address once before giving up,
         // and say out loud that the box was changed.
-        if (provider.value !== 'openai' || /\/v1$/.test(typed) || !typed) throw err
-        return ids(`${typed}/v1`).then((list) => {
-          baseUrl.value = `${typed}/v1`
+        if (typedProvider !== 'openai' || /\/v1$/.test(typedBase) || !typedBase) throw err
+        return ids(`${typedBase}/v1`, typedKey, typedProvider).then((list) => {
+          baseUrl.value = `${typedBase}/v1`
           note.textContent = `地址少了 /v1，已经补上再拉一次 —— `
           return list
         })
@@ -1562,6 +1664,25 @@ function settingsDialog(): void {
       })
   })
   let shown: string = llm.provider
+  // Filling the form from a preset. An empty address means "the vendor's own
+  // default", which is why it goes into the placeholder and never the value.
+  const applyVendor = (id: string): void => {
+    const preset = PRESETS.find((p) => p.id === id)
+    if (!preset) return
+    baseUrl.value = preset.baseUrl
+    baseUrl.placeholder = preset.kind === 'anthropic' ? '留空用官方地址' : '留空用官方地址，自建网关填 https://…/v1'
+    fillList(preset.models.map((m) => m.id))
+    vendorNote.textContent = preset.note
+    // The model only changes when it would otherwise be blank: silently
+    // replacing a name the user typed is how a working setup gets broken by
+    // clicking a dropdown they were only looking at.
+    if (!model.value.trim() || preset.models.some((m) => m.id === model.value)) {
+      model.value = preset.models[0]?.id ?? ''
+    }
+    const top = preset.models.find((m) => m.id === model.value)
+    if (top) context.value = String(top.contextK)
+    model.placeholder = preset.models[0]?.id ?? '点「拉取模型」或手填'
+  }
   const syncProvider = (from: string, to: string): void => {
     model.placeholder = MODEL[to]
     baseUrl.placeholder = to === 'anthropic' ? '留空用官方地址' : '留空用官方地址，自建网关填 https://…/v1'
@@ -1570,11 +1691,65 @@ function settingsDialog(): void {
     // user had chosen it, which is exactly how "拉取模型" ends up looking like
     // it worked while the field still holds yesterday's guess.
     if (model.value.trim() === MODEL[from]) model.value = ''
+    // A vendor list is dialect-specific; switching to Anthropic while it still
+    // lists DeepSeek names is a list that cannot be picked from.
+    const options = PRESETS.filter((p) => p.kind === to)
+    vendor.replaceChildren(
+      ...options.map((p) => {
+        const opt = document.createElement('option')
+        opt.value = p.id
+        opt.textContent = p.label
+        return opt
+      })
+    )
+    const keep = options.find((p) => p.kind === to && p.baseUrl === baseUrl.value.trim()) ?? options[0]
+    vendor.value = keep?.id ?? 'custom'
+    // Only the list and the note here: `applyVendor` writes into fields declared
+    // further down, and this runs while the dialog is being built.
+    const preset = PRESETS.find((p) => p.id === vendor.value)
+    vendorNote.textContent = preset?.note ?? ''
+    fillList(preset?.models.map((m) => m.id) ?? [])
   }
+  // The draft already holds what the store says, and `syncProvider` must not
+  // replace it on open — it only fills the vendor list. A preset is applied
+  // when the user picks one, and on a first run where there is nothing to lose.
   syncProvider(shown, shown)
+  if (vendorNote.textContent === '') {
+    const preset = PRESETS.find((p) => p.id === vendor.value)
+    vendorNote.textContent = preset?.note ?? ''
+    fillList(preset?.models.map((m) => m.id) ?? [])
+    model.placeholder = preset?.models[0]?.id ?? model.placeholder
+  }
+  // Wired here, after every field it writes into exists: `applyVendor` runs on
+  // a change, never during the build, so the dialog can be opened with a
+  // half-saved configuration without touching a TDZ.
+  vendor.addEventListener('change', () => applyVendor(vendor.value))
   provider.addEventListener('change', () => {
     syncProvider(shown, provider.value)
     shown = provider.value
+  })
+
+  test.addEventListener('click', () => {
+    test.disabled = true
+    note.textContent = '正在测试…（真发一条消息给模型）'
+    api
+      .testModel({
+        provider: provider.value as Settings['llm']['provider'],
+        baseUrl: baseUrl.value.trim(),
+        model: model.value.trim(),
+        apiKey: apiKey.value.trim() || undefined,
+        contextK: Math.max(8, Math.round(Number(context.value) || 128))
+      })
+      .then((reply) => {
+        note.textContent = `✓ 连接正常。模型回了：${reply.slice(0, 120)}`
+      })
+      .catch((err) => {
+        // Verbatim, not summarised: the whole point of the test is the reason.
+        note.textContent = `✗ ${short(err)}`
+      })
+      .finally(() => {
+        test.disabled = false
+      })
   })
   const apiKey = input('', 'password')
   apiKey.placeholder = llm.hasKey ? '已保存，留空则不修改' : '本地网关通常不用填'
@@ -1618,7 +1793,9 @@ function settingsDialog(): void {
     })(),
     field('终端背景图片', bgRow),
     el('div', 'field-sep', 'AI 助手'),
-    field('接口', provider),
+    field('协议', provider),
+    field('厂商预设', vendor),
+    vendorNote,
     field('接口地址', urlRow),
     field('模型', modelRow),
     field('上下文窗口（K）', context),
@@ -2631,12 +2808,17 @@ async function openSession(rawConn: Connection, externalId?: string): Promise<vo
   const agentBtn = tbtn('AI', 'agent', '用自然语言操作这台机器；只有会删数据、覆盖文件的命令才停下来问你', () =>
     toggleAgent(session)
   )
-  // Right-click on it goes to the saved conversations; a plain click still
-  // opens the live one, which is where the work happens.
+  // Right-click on it opens the panel straight onto its history; a plain click
+  // still opens the live conversation, which is where the work happens.
   agentBtn.addEventListener('contextmenu', (ev) => {
     ev.preventDefault()
     ev.stopPropagation()
-    void agentHistoryDialog(session.connectionId, { sessionId: session.id, view: session.agent! })
+    // The panel is window-level, so "open it" means open it for this tab too —
+    // syncAgentWithActive does every tab from the one switch.
+    if (session.agent && !agentOpen) toggleAgent(session)
+    if (session.agent) {
+      void openHistoryDrawer(session.agent, { sessionId: session.id, view: session.agent }, session.connectionId)
+    }
   })
 
   toolbar.append(
@@ -2839,6 +3021,16 @@ function handleTermKey(session: Session, ev: KeyboardEvent): boolean {
     toggleMonitor(session)
     return false
   }
+  if (ev.ctrlKey && ev.shiftKey && ev.code === 'KeyA') {
+    // The panel's drawer, from the keyboard. Only when the panel is open —
+    // otherwise this is the terminal's own Ctrl+A and must pass straight
+    // through to the remote shell.
+    const view = session.agent
+    if (!view || view.root.style.display === 'none') return true
+    void openHistoryDrawer(view, { sessionId: session.id, view }, session.connectionId)
+    view.drawerSearch.focus()
+    return false
+  }
   if (ev.ctrlKey && ev.shiftKey && ev.code === 'KeyB') {
     void toggleFiles(session)
     return false
@@ -2879,9 +3071,16 @@ function activate(sessionId: string): void {
   }
   const session = sessions.get(sessionId)
   if (!session) return
+  // One tab, one machine, one AI panel: the tab that came forward shows its
+  // conversation, the tabs left behind put theirs away.
+  syncAgentWithActive()
   requestAnimationFrame(() => {
     session.fit.fit()
-    session.term.focus()
+    // Focus follows the panel: switching to a tab whose AI side is open should
+    // leave the cursor where that tab's conversation is, not in a hidden term.
+    const panelOpen = session.agent && session.agent.root.style.display !== 'none'
+    if (panelOpen) session.agent?.input.focus()
+    else session.term.focus()
   })
   const conn = store.connections.find((c) => c.id === session.connectionId)
   $('#status-host').textContent = conn ? `${conn.username}@${conn.host}:${conn.port}` : ''
@@ -2952,6 +3151,10 @@ function handleEvent(ev: SessionEvent): void {
 
   if (ev.type === 'agent') {
     renderAgent(session, ev.event)
+    return
+  }
+  if (ev.type === 'agent-convo') {
+    if (session.agent) session.agent.root.dataset.convo = ev.conversationId
     return
   }
 
@@ -4311,6 +4514,21 @@ interface AgentView {
   /** Panel header buttons: close this panel, or put the conversation in a window. */
   close: HTMLElement
   popout: HTMLElement
+  /** The slide-over list of saved conversations, and what darkens the panel
+   *  behind it. Kept in the panel rather than a modal: switching conversations
+   *  is something people do constantly, and a modal over an already-narrow
+   *  panel loses the thing they were reading. */
+  drawer: HTMLElement
+  drawerList: HTMLElement
+  drawerSearch: HTMLInputElement
+  /** "这台机器 · name" above the list, so two hosts' drawers can never be
+   *  mistaken for one list. */
+  drawerScope: HTMLElement
+  veil: HTMLElement
+  /** Which saved conversation the drawer says is open. */
+  history: HTMLElement
+  /** Starts a fresh conversation in this panel (the header's ＋). */
+  newChat: () => void
   /** Set in a standalone window, which has no Session to look itself up with. */
   sessionId?: string
   connectionId?: string
@@ -4329,16 +4547,24 @@ function buildAgent(standalone = false): AgentView {
   root.append(grip)
 
   const head = el('div', 'agent-head')
-  head.append(el('span', 'agent-title', 'AI 助手'))
-  const wide = el('button', 'agent-mini agent-wide', '⤢')
+  // Three parts: what this conversation is, what it remembers, what it does.
+  // A drawer button on the left is where every chat app puts history, and the
+  // title changes with the conversation so the panel says which one is open.
+  const past = el('button', 'agent-icon', '☰')
+  past.title = '历史对话（Ctrl+Shift+A）'
+  past.setAttribute('aria-label', '历史对话')
+  const title = el('span', 'agent-title', 'AI 助手')
+  title.title = '当前对话'
+  const wide = el('button', 'agent-icon agent-wide', '⤢')
   wide.title = '占满整行，专看这边的命令和回复（再点一次还原）'
-  const popout = el('button', 'agent-mini', '⧉')
+  const popout = el('button', 'agent-icon', '⧉')
   popout.title = '在独立窗口中打开 AI 面板'
-  const clear = el('button', 'agent-mini', '清空')
-  const past = el('button', 'agent-mini', '历史')
-  past.title = '查看并导出这台机器的历史对话'
+  const clear = el('button', 'agent-icon', '＋')
+  clear.title = '新对话（清空当前会话）'
+  clear.setAttribute('aria-label', '新对话')
   const close = panelClose(standalone ? '关闭窗口' : '关闭 AI 面板', () => {})
-  head.append(wide, popout, past, clear, close)
+  head.append(past, title, el('span', 'spacer'), wide, popout, clear, close)
+
   if (standalone) {
     // No terminal to share the row with, nothing to pop out of, and the X
     // closes the window it is now the whole content of.
@@ -4356,13 +4582,31 @@ function buildAgent(standalone = false): AgentView {
     const target = cell
       ? { sessionId: cell.id, view }
       : { sessionId: view.sessionId ?? '', view }
-    void agentHistoryDialog(cell?.connectionId ?? view.connectionId ?? '', target)
+    void openHistoryDrawer(view, target, cell?.connectionId ?? view.connectionId ?? '')
   })
   root.append(head)
 
+  // The drawer and the veil live inside the panel, positioned over it. Opened
+  // by the ☰ button; closed by picking a conversation, by Esc, or by clicking
+  // the shaded area beside it.
+  const veil = el('div', 'agent-veil')
+  veil.hidden = true
+  const drawer = el('aside', 'agent-drawer')
+  drawer.hidden = true
+  const drawerSearch = document.createElement('input')
+  drawerSearch.type = 'search'
+  drawerSearch.className = 'agent-drawer-search'
+  drawerSearch.placeholder = '搜索历史对话'
+  // Which machine this list belongs to, said out loud. Two tabs on two hosts
+  // have identical-looking drawers otherwise, and "where did that conversation
+  // go" is a worse bug than it looks.
+  const drawerScope = el('div', 'agent-drawer-scope', '')
+  const drawerList = el('div', 'agent-drawer-list scroll')
+  drawer.append(drawerSearch, drawerScope, drawerList)
+
   const log = el('div', 'agent-log')
   log.append(agentHint())
-  root.append(log)
+  root.append(veil, drawer, log)
 
   // The panel is reachable before anything is configured — the whole feature
   // hiding behind a key nobody knows to set is how you ship an AI nobody finds.
@@ -4403,7 +4647,7 @@ function buildAgent(standalone = false): AgentView {
   attach.title = '添加附件：先传到服务器的 /tmp，再让它去读'
   const go = el('button', 'agent-go', '↑')
   go.title = '发送 (Enter)'
-  foot.append(attach, go)
+  foot.append(attach, el('span', 'agent-kbd-hint', 'Enter 发送 · Shift+Enter 换行'), go)
   box.append(filesRow, input, foot)
   compose.append(box)
   root.append(compose)
@@ -4427,13 +4671,43 @@ function buildAgent(standalone = false): AgentView {
     working: null,
     step: null,
     close,
-    popout
+    popout,
+    drawer,
+    drawerList,
+    drawerSearch,
+    drawerScope,
+    veil,
+    history: title,
+    newChat: () => clear.click()
   }
   clear.addEventListener('click', () => {
     const session = [...sessions.values()].find((s) => s.agent === view)
     const id = session?.id ?? view.sessionId
     if (id) void api.agentReset(id)
     clearAgentView(view)
+    view.history.textContent = 'AI 助手'
+    view.root.dataset.convo = ''
+    view.input.focus()
+  })
+  veil.addEventListener('click', () => closeHistoryDrawer(view))
+  view.drawerSearch.addEventListener('input', () => {
+    const target = [...sessions.values()].find((s) => s.agent === view)
+    void fillHistoryDrawer(
+      view,
+      target ? { sessionId: target.id, view } : { sessionId: view.sessionId ?? '', view },
+      target?.connectionId ?? view.connectionId ?? '',
+      view.drawerSearch.value
+    )
+  })
+  view.drawerSearch.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') {
+      ev.stopPropagation()
+      closeHistoryDrawer(view)
+    }
+    if (ev.key === 'Enter') {
+      const first = view.drawerList.querySelector('.agent-convo') as HTMLElement | null
+      first?.click()
+    }
   })
   setAgentBusy(view, false)
   return view
@@ -4445,13 +4719,13 @@ function wireAgent(session: Session): void {
 
   if (!view.root.classList.contains('agent-standalone')) {
     view.close.addEventListener('click', () => {
-      if (view.root.style.display !== 'none') toggleAgent(session)
+      if (agentOpen) toggleAgent(session)
     })
     view.popout.addEventListener('click', () => {
       void api.popOutAgent(session.id, session.connectionId).then((opened) => {
         // One conversation, one place to type in it: the window takes over and
         // the side panel folds away. The AI button still opens it again.
-        if (opened && view.root.style.display !== 'none') toggleAgent(session)
+        if (opened && agentOpen) toggleAgent(session)
       })
     })
   }
@@ -4624,18 +4898,17 @@ function addAgentRow(view: AgentView, cls: string, text: string): HTMLElement {
   return row
 }
 
-/** Outputs longer than a screenful fold away; a `df` should not. */
-function isLong(text: string): boolean {
-  return text.length > 600 || text.split('\n').length > 8
-}
-
 /** One tool call with its output folded underneath. The command and what it
  *  printed are one event; two floating blocks never made that obvious, and
  *  pairing them is what lets a transcript be read back like a log. */
 function agentStep(name: string, detail: string): HTMLElement {
+  // Always folded, including the one-line command itself: a turn that ran ten
+  // tools is then ten short lines to scan, not ten wrapped command paragraphs
+  // pushing the answer off screen. The title is still the whole command on hover.
   const box = el('div', 'agent-step folded')
   const head = el('button', 'agent-step-head', detail.startsWith(name) ? detail : `${name}  ${detail}`)
   head.type = 'button'
+  head.title = `${name}\n${detail}\n\n点开看完整输出`
   const body = el('div', 'agent-step-body')
   head.addEventListener('click', () => box.classList.toggle('folded'))
   box.append(head, body)
@@ -4646,9 +4919,10 @@ function fillAgentStep(step: HTMLElement, ok: boolean, text: string): void {
   step.classList.toggle('bad', !ok)
   const body = step.querySelector('.agent-step-body')
   if (body) body.textContent = text || '（无输出）'
-  // Failures stay visible even when long: that output is the whole reason to
-  // look at the step, and a click is a tax on the one row that matters.
-  if (!isLong(text) || !ok) step.classList.remove('folded')
+  // Stays folded whatever the length: the previous "long outputs fold, short
+  // ones don't" rule still let twenty short results push the conversation each
+  // turn. A failure is the one thing worth one click to see, so it opens.
+  if (!ok) step.classList.remove('folded')
 }
 
 /** The settled answer: swap the streamed plain text for rendered Markdown. */
@@ -4680,6 +4954,12 @@ function renderAgent(session: Session, ev: AgentEvent): void {
         'user',
         ev.files?.length ? `${ev.text}\n📎 ${ev.files.map(baseName).join('、')}` : ev.text
       )
+      // First thing said in a fresh conversation names it, here as well as in
+      // the saved copy — the header is how the user knows which one is open.
+      if (view.history.textContent === 'AI 助手') {
+        const one = ev.text.trim().replace(/\s+/g, ' ')
+        view.history.textContent = one.length > 28 ? `${one.slice(0, 28)}…` : one || 'AI 助手'
+      }
       // It was appended before the message it is waiting on; the waiting row
       // belongs at the bottom of the transcript, not above the question.
       if (view.working) view.log.append(view.working)
@@ -4841,25 +5121,125 @@ function syncAgentEntry(session: Session): void {
  *  shows it. Absent when there is nothing to continue into. */
 type ResumeTarget = { sessionId: string; view: AgentView }
 
-/** The list for one connection, newest first. A lid on the count, not a
- *  pager: past a few dozen, the export is the better way to read them. */
-async function agentHistoryDialog(connectionId: string, target?: ResumeTarget): Promise<void> {
+/**
+ * The saved conversations of one machine, sliding over the panel.
+ *
+ * This replaced a modal list for one reason: resuming is the main thing people
+ * do here, and a modal made them leave the conversation to find the next one.
+ * The drawer keeps the transcript behind it, filters as you type, and opens a
+ * conversation with one click — the same gesture as every chat app the user
+ * already knows.
+ */
+async function openHistoryDrawer(view: AgentView, target: ResumeTarget | null, connectionId: string): Promise<void> {
   if (!connectionId) return
+  view.drawer.hidden = false
+  view.veil.hidden = false
+  view.root.classList.add('drawer-open')
+  view.drawerSearch.value = ''
+  const conn = store.connections.find((c) => c.id === connectionId)
+  // The scope line is not decoration: it is what tells two tabs on two hosts
+  // apart when their lists look the same.
+  view.drawerScope.textContent = conn ? `只看 ${conn.name} · ${conn.host}` : '这台机器'
+  view.drawerScope.title = conn ? `${conn.username}@${conn.host}:${conn.port}` : ''
+  await fillHistoryDrawer(view, target, connectionId, '')
+  setTimeout(() => view.drawerSearch.focus(), 0)
+}
+
+function closeHistoryDrawer(view: AgentView): void {
+  view.drawer.hidden = true
+  view.veil.hidden = true
+  view.root.classList.remove('drawer-open')
+}
+
+async function fillHistoryDrawer(
+  view: AgentView,
+  target: ResumeTarget | null,
+  connectionId: string,
+  query: string
+): Promise<void> {
   const items = await api.agentHistory(connectionId)
-  const list = el('div', 'hist-list')
+  const q = query.trim().toLowerCase()
+  const shown = q ? items.filter((i) => (i.title || '').toLowerCase().includes(q)) : items
+  view.drawerList.replaceChildren()
 
-  if (!items.length) {
-    list.append(el('div', 'mon-empty', '这台机器还没有存下来的对话。'))
-  }
-  for (const item of items) {
-    const row = el('button', 'hist-item')
-    row.append(el('span', 'hist-title', item.title || '未命名对话'))
-    row.append(el('span', 'hist-when', when(item.updatedAt)))
-    row.addEventListener('click', () => void agentHistoryView(item.id, target))
-    list.append(row)
-  }
+  const fresh = el('button', 'agent-new', '＋ 新对话')
+  fresh.addEventListener('click', () => {
+    closeHistoryDrawer(view)
+    const live = [...sessions.values()].find((s) => s.agent === view)
+    if (live && live.id !== activeId) activate(live.id)
+    if (live && !agentOpen) toggleAgent(live)
+    view.newChat()
+    view.input.focus()
+  })
+  view.drawerList.append(fresh)
 
-  showModal('AI 历史对话', list, [{ label: '关闭', primary: true, onClick: closeModal }])
+  if (!shown.length) {
+    view.drawerList.append(
+      el('div', 'agent-drawer-empty', items.length ? '没有匹配的历史对话' : '这台机器还没有存下来的对话。')
+    )
+    return
+  }
+  let day = ''
+  for (const item of shown) {
+    // Grouped by day, the way a chat list is read: "today" is a different
+    // question from "what was I doing last month".
+    const d = dayOf(item.updatedAt)
+    if (d !== day) {
+      day = d
+      view.drawerList.append(el('div', 'agent-drawer-day', d))
+    }
+    const row = el('button', 'agent-convo')
+    if (item.id === currentConvoId(view)) row.classList.add('on')
+    const body = el('span', 'agent-convo-body')
+    body.append(el('span', 'agent-convo-title', item.title || '未命名对话'))
+    body.append(el('span', 'agent-convo-when', clockOf(item.updatedAt)))
+    row.append(body)
+    row.title = `${item.title || '未命名对话'}\n${when(item.updatedAt)}`
+    row.addEventListener('click', () => void openSavedConversation(view, target, item.id))
+    view.drawerList.append(row)
+  }
+}
+
+/** The conversation this panel is currently appending to, if any. Kept on the
+ *  view so the drawer can mark it without asking main. */
+function currentConvoId(view: AgentView): string | null {
+  return (view.root.dataset.convo ?? '') || null
+}
+
+/** "今天" / "昨天" / "2026-10-28" — only the grouping, not the exact time. */
+function dayOf(ms: number): string {
+  const d = new Date(ms)
+  const today = new Date()
+  const day = 24 * 60 * 60 * 1000
+  const startOf = (x: Date): number => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime()
+  const diff = Math.round((startOf(today) - startOf(d)) / day)
+  if (diff === 0) return '今天'
+  if (diff === 1) return '昨天'
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+function clockOf(ms: number): string {
+  const d = new Date(ms)
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  // Always the time of day: the day is already the group heading, and an empty
+  // right column made newer rows look like they had lost their timestamp.
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+/** Opening a saved conversation from the drawer: resume it in place when there
+ *  is a live tab, otherwise show it read-only in a modal (the pop-out and the
+ *  "no terminal here" window have nowhere to continue into). */
+async function openSavedConversation(
+  view: AgentView,
+  target: ResumeTarget | null,
+  id: string
+): Promise<void> {
+  closeHistoryDrawer(view)
+  if (target) {
+    const ok = await resumeAgentConversation(target, id)
+    if (ok) return
+  }
+  await agentHistoryView(id, target)
 }
 
 function when(ms: number): string {
@@ -4868,10 +5248,10 @@ function when(ms: number): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
-/** One saved conversation. Read-only in the archive view (the approval cards are
- *  a record of what was asked), but resumable: «继续」 turns it back into the
- *  live conversation of the session that reopened it. */
-async function agentHistoryView(id: string, target?: ResumeTarget): Promise<void> {
+/** One saved conversation, read-only. The drawer resumes in place when there is
+ *  a live tab; this is what the pop-out and the no-terminal window open, and it
+ *  is also where a conversation is deleted or exported. */
+async function agentHistoryView(id: string, target?: ResumeTarget | null): Promise<void> {
   const convo = await api.agentHistoryGet(id)
   if (!convo) return
   const view = el('div', 'agent-log history-view')
@@ -4881,13 +5261,12 @@ async function agentHistoryView(id: string, target?: ResumeTarget): Promise<void
   const body = el('div', 'hist-body')
   body.append(view)
   const actions = [
-    { label: '返回', onClick: (): void => void agentHistoryDialog(convo.connectionId, target) },
     {
       label: '删除',
       danger: true,
       onClick: async (): Promise<void> => {
         await api.agentHistoryDelete(convo.id)
-        await agentHistoryDialog(convo.connectionId, target)
+        closeModal()
       }
     },
     {
@@ -4905,7 +5284,10 @@ async function agentHistoryView(id: string, target?: ResumeTarget): Promise<void
           {
             label: '继续这个对话',
             primary: true,
-            onClick: (): void => void resumeAgentConversation(target, convo.id)
+            onClick: async (): Promise<void> => {
+              closeModal()
+              await resumeAgentConversation(target, convo.id)
+            }
           }
         ]
       : [])
@@ -4915,21 +5297,27 @@ async function agentHistoryView(id: string, target?: ResumeTarget): Promise<void
 
 /** Puts a saved conversation back in front of the model and on screen. The
  *  transcript itself arrives through the cleared broadcast, like every other
- *  redraw — this only has to say whether it worked. */
-async function resumeAgentConversation(target: ResumeTarget, id: string): Promise<void> {
+ *  redraw — this only has to say whether it worked. Resolves false when the tab
+ *  is mid-turn and cannot take another history. */
+async function resumeAgentConversation(target: ResumeTarget, id: string): Promise<boolean> {
   const ok = await api.agentResume(target.sessionId, viewConnectionId(target), id)
   if (!ok) {
-    closeModal()
     log('warn', '这个标签页正在处理上一轮，等它结束再继续历史对话。')
-    return
+    return false
   }
-  closeModal()
   const view = target.view
-  if (view.root.style.display === 'none') {
-    const session = [...sessions.values()].find((s) => s.agent === view)
-    if (session) toggleAgent(session)
-  }
+  const session = [...sessions.values()].find((s) => s.agent === view)
+  // Bring the tab to the front first: resuming into a background tab would
+  // restore the transcript somewhere the user cannot see it.
+  if (session && session.id !== activeId) activate(session.id)
+  if (session && !agentOpen) toggleAgent(session)
+  // The title follows the conversation, so the header says what is open —
+  // without this every resumed conversation still reads "AI 助手".
+  const convo = await api.agentHistoryGet(id)
+  view.history.textContent = convo?.title || 'AI 助手'
+  view.root.dataset.convo = id
   view.input.focus()
+  return true
 }
 
 /** A panel knows its connection either through its Session or, in a popped-out
@@ -4995,19 +5383,39 @@ function archiveRows(events: AgentEvent[]): HTMLElement[] {
   return out
 }
 
+/** Whether the AI panel is open. One switch for the whole window, not one per
+ *  tab: people leave the assistant open and flip between machines, and having
+ *  the panel vanish on every tab switch (then re-open it by hand) made the
+ *  panel feel broken. Switching tabs now swaps the conversation inside an
+ *  already-open panel, which is also how the terminal itself behaves. */
+let agentOpen = false
+
+/** Switching tabs switches the AI conversation with them: the panel stays
+ *  where it is, the transcript and the toolbar state change over. */
+function syncAgentWithActive(): void {
+  for (const session of sessions.values()) {
+    if (!session.agent) continue
+    const on = session.id === activeId
+    session.agent.root.style.display = on && agentOpen ? 'flex' : 'none'
+    session.toolbar.querySelector<HTMLElement>('[data-act="agent"]')?.classList.toggle('on', on && agentOpen)
+    // A drawer belongs to the tab it was opened from.
+    if (!on) closeHistoryDrawer(session.agent)
+  }
+}
+
 function toggleAgent(session: Session): void {
   const view = session.agent
   if (!view) return
-  const open = view.root.style.display !== 'none'
-  view.root.style.display = open ? 'none' : 'flex'
-  session.toolbar.querySelector<HTMLElement>('[data-act="agent"]')?.classList.toggle('on', !open)
-  if (open) {
-    // Nothing to stop: the conversation outlives the panel, and a running turn
-    // keeps running so its commands stay visible when you come back.
-  } else {
-    session.fit.fit()
-    view.input.focus()
-  }
+  const wasOpen = agentOpen
+  agentOpen = !agentOpen
+  // Every tab follows: the panel is a window-level thing, and the tab the user
+  // just switched to keeps whatever the panel was showing open.
+  syncAgentWithActive()
+  // Opening gives the panel its share of the row and puts the cursor in it;
+  // closing only has to re-fit. A running turn is untouched either way — its
+  // transcript is in the main process.
+  session.fit.fit()
+  if (!wasOpen) view.input.focus()
 }
 
 /* ------------------------------------------------------------------ *
@@ -5129,10 +5537,27 @@ function globalKeys(ev: KeyboardEvent): void {
     return
   }
   if (target.closest?.('.term-box')) return
+  // Ctrl+F is the one app shortcut that has to work while the cursor is in a
+  // text field: the sidebar search box is a text field, and re-hitting the
+  // shortcut from it should select what is there, not do nothing.
+  if ((ev.ctrlKey || ev.metaKey) && !ev.shiftKey && !ev.altKey && ev.code === 'KeyF') {
+    ev.preventDefault()
+    focusTreeSearch()
+    return
+  }
   if (!$('#overlay').hidden) return
   if (['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) return
   ev.preventDefault()
   appKey(ev)
+}
+
+/** Puts the cursor in the sidebar search, unfolding the sidebar first — a
+ *  shortcut that focuses an invisible box is a shortcut that does nothing. */
+function focusTreeSearch(): void {
+  if (store.settings.sidebarCollapsed) applySidebar(false)
+  const box = $('#tree-search') as HTMLInputElement
+  box.focus()
+  box.select()
 }
 
 /** App-wide shortcuts; true when the key was ours. */
@@ -5169,6 +5594,7 @@ function appKey(ev: KeyboardEvent): boolean {
 const SHORTCUTS: [string, string][] = [
   ['Ctrl + T', '新建连接'],
   ['Ctrl + B', '收起 / 展开连接列表'],
+  ['Ctrl + F', '搜索连接（名称、IP、用户名）'],
   ['⌘ / 🔑', '命令面板 / 私钥管理'],
   ['Ctrl + ,', '设置'],
   ['Ctrl + /', '快捷键一览'],
@@ -5179,6 +5605,7 @@ const SHORTCUTS: [string, string][] = [
   ['Ctrl + Shift + F', '终端内查找'],
   ['Ctrl + Shift + B', '文件面板'],
   ['Ctrl + Shift + M', '资源监控'],
+  ['Ctrl + Shift + A', 'AI 历史对话（面板打开时）'],
   ['Ctrl + Shift + H', '历史命令'],
   ['Ctrl + Shift + K', '清屏'],
   ['Ctrl + S', '编辑器：存回服务器'],
@@ -5257,6 +5684,40 @@ function wireChrome(): void {
   $('#btn-quick').addEventListener('click', commandPalette)
   $('#btn-keyring').addEventListener('click', () => void keysDialog())
   $('#btn-keys').addEventListener('click', shortcutsDialog)
+
+  const searchBox = $('#tree-search') as HTMLInputElement
+  const searchClear = $('#tree-search-clear')
+  searchBox.addEventListener('input', () => {
+    treeQuery = searchBox.value
+    searchClear.hidden = !treeQuery
+    renderTree()
+  })
+  searchBox.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') {
+      searchBox.value = ''
+      treeQuery = ''
+      searchClear.hidden = true
+      renderTree()
+      searchBox.blur()
+    }
+    // Down arrow goes straight to the first found machine, like every other
+    // list in the app; from there it is double-click or Enter.
+    if (ev.key === 'ArrowDown') {
+      ev.preventDefault()
+      const first = $('#tree .node.search-hit') as HTMLElement | null
+      if (!first) return
+      first.classList.add('sel')
+      first.scrollIntoView({ block: 'nearest' })
+      first.focus()
+    }
+  })
+  searchClear.addEventListener('click', () => {
+    searchBox.value = ''
+    treeQuery = ''
+    searchClear.hidden = true
+    renderTree()
+    searchBox.focus()
+  })
 
   window.addEventListener('mousedown', (ev) => {
     if (menuEl && !menuEl.contains(ev.target as Node)) closeMenu()

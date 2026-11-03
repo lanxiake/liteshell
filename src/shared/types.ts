@@ -593,6 +593,19 @@ export interface Api {
    *  tried, so a missing `/v1` is visible instead of a bare 404. */
   listModels(cfg: { provider: LlmSettings['provider']; baseUrl: string; apiKey?: string }): Promise<string[]>
 
+  /** One tiny real request — a "hello" with the tool list — so a wrong address,
+   *  a dead key or a model the gateway has no channel for is reported before
+   *  the user finds out mid-conversation. Resolves with what the model answered
+   *  or threw with the same message the panel would show. */
+  testModel(cfg: {
+    provider: LlmSettings['provider']
+    baseUrl: string
+    model: string
+    apiKey?: string
+    /** Read by the OpenAI-compatible path only; harmless elsewhere. */
+    contextK?: number
+  }): Promise<string>
+
   /** Repaints the OS window buttons so they match the active theme. */
   setWindowChrome(background: string, foreground: string): Promise<void>
 
@@ -739,3 +752,7 @@ export type SessionEvent =
   | { type: 'log'; sessionId: string; level: 'debug' | 'info' | 'warn'; text: string }
   | { type: 'transfer'; sessionId: string; transfer: Transfer }
   | { type: 'agent'; sessionId: string; event: AgentEvent }
+  /** Which saved conversation the last agent event belongs to. Sent alongside
+   *  (not inside) the event because the panel needs it to mark the drawer's
+   *  current row and to name itself; it is not part of the transcript. */
+  | { type: 'agent-convo'; sessionId: string; conversationId: string }

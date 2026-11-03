@@ -27,6 +27,10 @@ export interface Turn {
   echo: unknown
   /** Normalised to 'tool_use' | 'end_turn' | 'max_tokens' | 'refusal' | 'other'. */
   stop: string
+  /** The model said something in its reasoning channel. An empty answer with
+   *  reasoning in it is a different problem from an empty answer with nothing
+   *  at all, and the message the user gets has to tell them apart. */
+  thought: boolean
 }
 
 export interface Provider {
@@ -130,7 +134,7 @@ function anthropicProvider(s: LlmSettings, system: string): Provider {
 
       const raw = message.stop_reason ?? 'end_turn'
       const stop = raw === 'tool_use' || raw === 'end_turn' || raw === 'max_tokens' || raw === 'refusal' ? raw : 'other'
-      return { text, calls, echo: message.content, stop }
+      return { text, calls, echo: message.content, stop, thought: message.content.some((b) => b.type === 'thinking') }
     }
   }
 }
@@ -187,29 +191,49 @@ function openaiProvider(s: LlmSettings, system: string): Provider {
 
   return {
     async turn(messages, tools, onDelta, signal, sys) {
-      const stream = await client.chat.completions.create(
-        {
-          model: s.model,
-          messages: flatten(messages, sys ?? system),
-          ...(tools.length
-            ? {
-                tools: tools.map((t) => ({
-                  type: 'function' as const,
-                  function: { name: t.name, description: t.description, parameters: t.parameters }
-                }))
-              }
-            : {}),
-          stream: true
-        },
-        { signal }
-      )
+      // Asked for the response alongside the stream so a body that never became
+      // SSE can be read and quoted. A gateway answering 200 with an error in
+      // JSON — or a 200 with a web page — makes the SDK hand back a stream with
+      // zero chunks and no exception, so "0 chunks" is the only signal that
+      // something went wrong; without the raw text all the user gets is "the
+      // interface returned nothing", and the reason it says is anybody's guess.
+      const { data: stream, response } = await client.chat.completions
+        .create(
+          {
+            model: s.model,
+            messages: flatten(messages, sys ?? system),
+            ...(tools.length
+              ? {
+                  tools: tools.map((t) => ({
+                    type: 'function' as const,
+                    function: { name: t.name, description: t.description, parameters: t.parameters }
+                  }))
+                }
+              : {}),
+            stream: true
+          },
+          { signal }
+        )
+        .withResponse()
+
+      // A body that is not SSE never becomes frames — the SDK's reader finds no
+      // `data:` lines and yields nothing. Read it *before* iterating (the body
+      // is locked once the iterator takes it over) so the reason the gateway
+      // gave can be quoted instead of guessing at the address.
+      const type = response.headers.get('content-type') ?? ''
+      if (!/text\/event-stream/i.test(type)) {
+        const body = await response.text().catch(() => '')
+        throw await silentStream(response, s.model, type, body)
+      }
 
       let text = ''
       let reasoning = ''
       let finish: string | null = null
+      let chunks = 0
       const frags: Frag[] = []
 
       for await (const chunk of stream) {
+        chunks++
         const choice = chunk.choices?.[0]
         if (!choice) continue
         const delta = choice.delta as Delta | undefined
@@ -271,14 +295,74 @@ function openaiProvider(s: LlmSettings, system: string): Provider {
               : finish === 'stop'
                 ? 'end_turn'
                 : 'other'
-      return { text, calls, echo, stop }
+      if (chunks === 0) throw silentStream(response, s.model, type, '')
+      return { text, calls, echo, stop, thought: !!reasoning }
     }
   }
+}
+
+/**
+ * What to say about a stream that produced no frames at all.
+ *
+ * This is the failure mode that made the gateway look like a wrong address: a
+ * request the vendor accepted (`HTTP 200`) whose body is a JSON error object, an
+ * HTML page, or bare `data: [DONE]`. The OpenAI SDK reads it as an empty stream
+ * and says nothing, so the only evidence left is the raw body — read it and
+ * quote it, because the reason ("no channel for this model in this group",
+ * "upstream saturated") is the one thing that tells the user what to fix.
+ */
+async function silentStream(response: Response, model: string, type: string, body: string): Promise<Error> {
+  const snippet = body.trim().slice(0, 400).replace(/\s+/g, ' ')
+  const err = new Error(
+    [
+      `接口返回了 HTTP ${response.status}，但没有吐出任何流式内容（0 帧）。`,
+      `模型：${model}`,
+      type ? `返回类型：${type}` : '',
+      snippet ? `返回正文：${snippet}` : '返回正文是空的。',
+      '常见原因：网关给这个模型/分组没有可用渠道、额度或并发耗尽、地址指到了网站首页而不是 /v1 接口。'
+    ]
+      .filter(Boolean)
+      .join('\n')
+  )
+  // describe() switches on this; 200 is truthful and would fall through to the
+  // generic branch, so the message above is what gets shown.
+  ;(err as Error & { status?: number }).status = response.status
+  return err
 }
 
 export function makeProvider(s: LlmSettings, system: string): Provider {
   return s.provider === 'anthropic' ? anthropicProvider(s, system) : openaiProvider(s, system)
 }
+
+/**
+ * One real request to see whether the settings work at all: same provider,
+ * same tool list, one short question. Errors come back in the same shape the
+ * panel would show, because "works in the test, fails in the panel" is the
+ * difference between a bad setting and a bad conversation.
+ */
+export async function testModel(s: LlmSettings): Promise<string> {
+  const tool: ToolSpec = {
+    name: 'ping',
+    description: '确认工具调用通道可用。',
+    parameters: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] }
+  }
+  const turn = await makeProvider(s, SYSTEM_FOR_TEST).turn(
+    [{ role: 'user', text: '回复「连接正常」四个字即可。' }],
+    [tool],
+    () => undefined,
+    AbortSignal.timeout(45_000)
+  )
+  const said = turn.text.trim() || (turn.calls.length ? `（模型调用了工具 ${turn.calls.map((c) => c.name).join('、')}）` : '')
+  if (!said) {
+    throw new Error(
+      `模型没有回答：既没有文字也没有工具调用${turn.thought ? '（只有思考内容）' : ''}。` +
+        '这个模型可能不支持工具调用，或者网关对它没有可用渠道。'
+    )
+  }
+  return said
+}
+
+export const SYSTEM_FOR_TEST = '你是连通性测试。只回一句话。'
 
 /**
  * The model list, straight from the endpoint the settings point at. Both

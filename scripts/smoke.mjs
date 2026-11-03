@@ -192,7 +192,7 @@ let llm
 let child
 let failures = 0
 
-function check(label, ok, detail = '') {
+async function check(label, ok, detail = '') {
   console.log(`${ok ? '  ok  ' : ' FAIL '} ${label}${detail ? ` — ${detail}` : ''}`)
   if (!ok) failures++
 }
@@ -380,6 +380,15 @@ function startLlm() {
       if (payload.model === 'empty-page') {
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
         res.end('<!doctype html><html><body>网关首页</body></html>')
+        return
+      }
+
+      // A 200 whose body is a JSON error — a gateway with no channel for the
+      // model. Same silent-empty-stream shape as the page above, and the panel
+      // has to quote the reason instead of guessing at the address.
+      if (payload.model === 'no-channel') {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: { message: '分组 default 下模型 smoke 无可用渠道', type: 'new_api_error' } }))
         return
       }
 
@@ -674,7 +683,7 @@ async function waitFor(cdp, expression, label, timeout = 20000) {
     if (await evaluate(cdp, expression)) return true
     await sleep(300)
   }
-  check(label, false, `timed out after ${timeout}ms`)
+  await check(label, false, `timed out after ${timeout}ms`)
   return false
 }
 
@@ -707,7 +716,7 @@ async function main() {
   await cdp.send('Page.enable')
 
   if (!(await evaluate(cdp, `typeof window.api === 'object' && typeof window.api.getStore === 'function'`))) {
-    check('preload 暴露了 window.api', false)
+    await check('preload 暴露了 window.api', false)
     console.log(console_.join('\n') || '(renderer console was empty)')
     throw finish(1)
   }
@@ -718,26 +727,26 @@ async function main() {
     throw finish(1)
   }
 
-  check('连接树渲染出预置连接', await evaluate(cdp, `!!document.querySelector('.node .label')`))
-  check(
+  await check('连接树渲染出预置连接', await evaluate(cdp, `!!document.querySelector('.node .label')`))
+  await check(
     '连接与文件夹都在树里',
     (await evaluate(cdp, `[...document.querySelectorAll('.node .label')].map(n => n.textContent).join('|')`)) ===
       '冒烟测试|local-smoke|local-pw|local-loose'
   )
-  check('文件夹已展开显示子节点', (await evaluate(cdp, `document.querySelectorAll('.node').length`)) >= 2)
+  await check('文件夹已展开显示子节点', (await evaluate(cdp, `document.querySelectorAll('.node').length`)) >= 2)
 
   /* ---------------- sidebar: collapse, right-click, drag ---------------- */
 
   await evaluate(cdp, `document.querySelector('#btn-side').click()`)
-  check('标题栏能收起连接列表', await evaluate(cdp, `document.body.classList.contains('side-off') && !document.querySelector('#sidebar').offsetParent`))
+  await check('标题栏能收起连接列表', await evaluate(cdp, `document.body.classList.contains('side-off') && !document.querySelector('#sidebar').offsetParent`))
   await evaluate(cdp, `document.querySelector('#btn-side').click()`)
-  check('再点一次展开', await evaluate(cdp, `!document.body.classList.contains('side-off') && !!document.querySelector('#sidebar').offsetParent`))
+  await check('再点一次展开', await evaluate(cdp, `!document.body.classList.contains('side-off') && !!document.querySelector('#sidebar').offsetParent`))
 
   await evaluate(cdp, `(() => {
     const tree = document.querySelector('#tree')
     tree.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 40, clientY: 400 }))
   })()`)
-  check('列表空白处右键能新建',
+  await check('列表空白处右键能新建',
     await evaluate(cdp, `(() => {
       const labels = [...document.querySelectorAll('#menu div')].map(d => d.textContent)
       return labels.includes('新建连接') && labels.includes('新建文件夹')
@@ -754,7 +763,7 @@ async function main() {
     tree.dispatchEvent(new DragEvent('drop', { bubbles: true, dataTransfer: dt, clientX: 40, clientY: 500 }))
     src.dispatchEvent(new DragEvent('dragend', { bubbles: true, dataTransfer: dt }))
   })()`)
-  check(
+  await check(
     '把连接拖到空白处就是移到根目录',
     await waitFor(
       cdp,
@@ -766,9 +775,48 @@ async function main() {
 
   // Clicking now only selects; opening is the double click.
   await evaluate(cdp, `document.querySelectorAll('.node')[1].click()`)
-  check('单击只是选中，不会自己连上去',
+  await check('单击只是选中，不会自己连上去',
     await evaluate(cdp, `document.querySelectorAll('.node')[1].classList.contains('sel') && document.querySelectorAll('#tabs .tab').length === 0`),
     await evaluate(cdp, `document.querySelectorAll('#tabs .tab').length`))
+
+  /* ---------------- sidebar search ---------------- */
+
+  // By IP: the case that made people scroll. `127.0.0` matches both fixtures,
+  // so the count is the tell that the filter looks at hosts and not names.
+  const typeSearch = async (text) => {
+    await evaluate(cdp, `(() => {
+      const box = document.querySelector('#tree-search')
+      box.value = ${JSON.stringify(text)}
+      box.dispatchEvent(new Event('input', { bubbles: true }))
+    })()`)
+    return Number(await evaluate(cdp, `document.querySelectorAll('#tree .node.search-hit').length`))
+  }
+  await check('搜索框默认就在侧栏里', (await evaluate(cdp, `!!document.querySelector('#tree-search')`)) === true)
+  await check('按 IP 搜出这段地址上的连接', (await typeSearch('127.0.0.1')) >= 3)
+  await check('按名称也能搜', (await typeSearch('loose')) === 1,
+    await evaluate(cdp, `[...document.querySelectorAll('#tree .node.search-hit .label')].map(n => n.textContent).join('|')`))
+  await check('搜用户名也能命中（loose 那条是 nobody）', (await typeSearch('nobody')) === 1)
+  await typeSearch('no-such-host-xyz')
+  await check('搜不到时说明没有匹配，而不是空白一片',
+    (await evaluate(cdp, `document.querySelector('#tree .empty-hint')?.textContent ?? ''`)).includes('没有匹配'))
+  await check('清空后回到原来的树', (await typeSearch('')) === 0 &&
+    (await evaluate(cdp, `!!document.querySelector('#tree .node:not(.search-hit)')`)) === true)
+  // Enter on a found row opens it; that is what makes the focus ring useful.
+  await typeSearch('loose')
+  await evaluate(cdp, `(() => {
+    const node = document.querySelector('#tree .node.search-hit')
+    node.focus()
+    node.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+  })()`)
+  await check('键盘在结果上按 Enter 就能连', await waitFor(cdp, `document.querySelectorAll('#tabs .tab').length === 1`, '从搜索结果连上', 15000))
+  await evaluate(cdp, `(() => {
+    const box = document.querySelector('#tree-search')
+    box.value = ''
+    box.dispatchEvent(new Event('input', { bubbles: true }))
+  })()`)
+  await evaluate(cdp, `document.querySelector('#tabs .tab .close').click()`)
+  await waitFor(cdp, `document.querySelectorAll('#tabs .tab').length === 0`, '关掉那条搜索打开的标签')
+
   await evaluate(cdp, `document.querySelectorAll('.node')[1].dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))`)
 
   const gotBanner = await waitFor(
@@ -777,20 +825,20 @@ async function main() {
     '终端渲染出远端 banner'
   )
   if (gotBanner) {
-    check('终端渲染出远端 banner', true)
+    await check('终端渲染出远端 banner', true)
   }
 
-  check(
+  await check(
     '状态栏显示已连接',
     /已连接/.test(await evaluate(cdp, `document.querySelector('#status-text').textContent`))
   )
-  check('标签页已创建', (await evaluate(cdp, `document.querySelectorAll('.tab').length`)) === 1)
-  check('快捷命令条已渲染', (await evaluate(cdp, `document.querySelectorAll('.quickbar .chip').length`)) >= 2)
+  await check('标签页已创建', (await evaluate(cdp, `document.querySelectorAll('.tab').length`)) === 1)
+  await check('快捷命令条已渲染', (await evaluate(cdp, `document.querySelectorAll('.quickbar .chip').length`)) >= 2)
   const chipTips = JSON.parse(
     await evaluate(cdp, `JSON.stringify([...document.querySelectorAll('.quickbar .chip')].map(c => c.title))`)
   )
-  check('快捷命令悬停给出作用', chipTips.some((t) => t.includes('实时访问日志')), JSON.stringify(chipTips))
-  check('自造的命令只显示命令本身', chipTips.includes('echo hi'), JSON.stringify(chipTips))
+  await check('快捷命令悬停给出作用', chipTips.some((t) => t.includes('实时访问日志')), JSON.stringify(chipTips))
+  await check('自造的命令只显示命令本身', chipTips.includes('echo hi'), JSON.stringify(chipTips))
 
   // Typing must reach the server and come back — proves the write path.
   await evaluate(cdp, `document.querySelector('.xterm-helper-textarea').focus()`)
@@ -812,7 +860,7 @@ async function main() {
       '输入回显 (写入通道)'
     )
   ) {
-    check('输入回显 (写入通道)', true)
+    await check('输入回显 (写入通道)', true)
   }
 
   /* ---------------- command history ---------------- */
@@ -838,7 +886,7 @@ async function main() {
 
   await evaluate(cdp, `document.querySelector('.xterm-helper-textarea').focus()`)
   await cdp.send('Input.insertText', { text: 'type' })
-  check(
+  await check(
     '输入前缀时弹出历史候选',
     await waitFor(
       cdp,
@@ -849,7 +897,7 @@ async function main() {
 
   // ↓ walks into the panel from the top; ↑ walks back out of the selection.
   await key('ArrowDown', 40)
-  check(
+  await check(
     '↓ 从顶部进入候选面板',
     await evaluate(
       cdp,
@@ -858,15 +906,15 @@ async function main() {
     )
   )
   await key('ArrowUp', 38)
-  check('↑ 从候选里退出来', await evaluate(cdp, `!document.querySelector('.suggest-row.sel')`))
+  await check('↑ 从候选里退出来', await evaluate(cdp, `!document.querySelector('.suggest-row.sel')`))
   await key('ArrowDown', 40)
 
   await key('Tab', 9)
-  check('Tab 补全并收起候选', await waitFor(cdp, `document.querySelector('.suggest').hidden`, 'Tab 补全并收起候选'))
+  await check('Tab 补全并收起候选', await waitFor(cdp, `document.querySelector('.suggest').hidden`, 'Tab 补全并收起候选'))
 
   // The candidate box must sit under the prompt line, not on top of the output.
   await key('u', 85, 2) // Ctrl-U: clear the line the Tab left behind
-  check(
+  await check(
     'Tab 之后按键仍然归终端（Ctrl-U 清空命令行）',
     await waitFor(
       cdp,
@@ -875,7 +923,7 @@ async function main() {
     )
   )
   await cdp.send('Input.insertText', { text: 'sys' })
-  check(
+  await check(
     '内置常用命令也能补全',
     await waitFor(
       cdp,
@@ -883,7 +931,7 @@ async function main() {
       '内置常用命令也能补全'
     )
   )
-  check(
+  await check(
     '字典候选带中文说明',
     /服务/.test(await evaluate(cdp, `document.querySelector('.suggest-desc')?.textContent ?? ''`)),
     await evaluate(cdp, `document.querySelector('.suggest-desc')?.textContent`)
@@ -909,9 +957,9 @@ async function main() {
   // The candidate box floats over the terminal instead of taking a row of it:
   // an in-flow box resized the terminal every time the list changed, and the
   // shell redrew its prompt a few lines higher. That was the jump.
-  check('候选框是浮层，不占布局', geo.position === 'absolute', JSON.stringify(geo))
-  check('候选框落在输入行下面（像输入法）', geo.boxTop >= geo.screenTop, JSON.stringify(geo))
-  check('候选框没有横跨整个面板', geo.boxWidth <= 460 && geo.boxWidth < geo.paneWidth, JSON.stringify(geo))
+  await check('候选框是浮层，不占布局', geo.position === 'absolute', JSON.stringify(geo))
+  await check('候选框落在输入行下面（像输入法）', geo.boxTop >= geo.screenTop, JSON.stringify(geo))
+  await check('候选框没有横跨整个面板', geo.boxWidth <= 460 && geo.boxWidth < geo.paneWidth, JSON.stringify(geo))
   // Rows and pty stay put while the list comes and goes.
   const dims = await evaluate(
     cdp,
@@ -925,36 +973,36 @@ async function main() {
     `(() => { const s = document.querySelector('.pane.active');
        return JSON.stringify({ rows: s.querySelector('.xterm-screen').getBoundingClientRect().height }) })()`
   )
-  check('候选框出现或消失时终端尺寸不动（输入框不跳）', dims === dimsAfter, `${dims} vs ${dimsAfter}`)
+  await check('候选框出现或消失时终端尺寸不动（输入框不跳）', dims === dimsAfter, `${dims} vs ${dimsAfter}`)
 
   /* ---------------- follow-up options ---------------- */
 
   await cdp.send('Input.insertText', { text: 'docker p' })
-  check(
+  await check(
     '命令名打完后给出后续选项',
     await waitFor(cdp, `document.querySelector('.suggest-cmd')?.textContent === 'docker ps -a'`, '后续选项')
   )
-  check(
+  await check(
     '后续选项带中文说明',
     /容器/.test(await evaluate(cdp, `document.querySelector('.suggest-desc')?.textContent ?? ''`)),
     await evaluate(cdp, `document.querySelector('.suggest-desc')?.textContent`)
   )
-  check(
+  await check(
     '候选行悬停显示完整命令与作用',
     /^docker ps -a\n所有容器$/.test(await evaluate(cdp, `document.querySelector('.suggest-row').title`)),
     JSON.stringify(await evaluate(cdp, `document.querySelector('.suggest-row').title`))
   )
   // Nothing highlighted yet, so ↑ is the shell's history — the panel gets out of its way.
   await key('ArrowUp', 38)
-  check('没选中时 ↑ 交还给 shell', await waitFor(cdp, `document.querySelector('.suggest').hidden`, '↑ 交还 shell'))
+  await check('没选中时 ↑ 交还给 shell', await waitFor(cdp, `document.querySelector('.suggest').hidden`, '↑ 交还 shell'))
   await key('u', 85, 2)
 
   await sleep(1500)
   const saved = JSON.parse(readFileSync(join(profile, 'liteshell.json'), 'utf8'))
-  check('历史命令落到磁盘（按连接分开）', (saved.history?.smoke ?? []).includes('typecheck'), JSON.stringify(saved.history))
+  await check('历史命令落到磁盘（按连接分开）', (saved.history?.smoke ?? []).includes('typecheck'), JSON.stringify(saved.history))
 
   await evaluate(cdp, `[...document.querySelectorAll('.tbtn')].find(b => b.textContent === '历史').click()`)
-  check(
+  await check(
     '历史命令面板列出已输入的命令',
     await waitFor(cdp, `document.querySelector('.hist-row')?.textContent === 'typecheck'`, '历史面板列出命令')
   )
@@ -965,18 +1013,18 @@ async function main() {
 
   await evaluate(cdp, `document.querySelector('.xterm-helper-textarea').focus()`)
   await key('Slash', 191, 2)
-  check(
+  await check(
     'Ctrl+/ 打开快捷键一览',
     await waitFor(cdp, `document.querySelectorAll('.key-row').length >= 10`, 'Ctrl+/ 打开快捷键一览')
   )
   await evaluate(cdp, `document.querySelector('#overlay').dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))`)
   await waitFor(cdp, `document.querySelector('#overlay').hidden`, '快捷键面板关闭')
 
-  check(
+  await check(
     '首次连接展示主机密钥指纹 (TOFU)',
     /SHA256:/.test(await evaluate(cdp, `document.querySelector('.notice').textContent`))
   )
-  check(
+  await check(
     '连接过程未产生错误提示',
     await evaluate(cdp, `!document.querySelector('.notice').classList.contains('error')`)
   )
@@ -991,13 +1039,13 @@ async function main() {
       '文件面板列出远端目录'
     )
   ) {
-    check('文件面板列出远端目录', true)
+    await check('文件面板列出远端目录', true)
   }
-  check(
+  await check(
     '目录排在文件前面',
     await evaluate(cdp, `document.querySelector('.files-list .row').classList.contains('dir')`)
   )
-  check(
+  await check(
     '文件大小已格式化',
     /11 B/.test(
       await evaluate(
@@ -1020,7 +1068,7 @@ async function main() {
     `${CRUMBS} === '/tree'`,
     '双击进入子目录'
   )
-  check('双击进入子目录', entered)
+  await check('双击进入子目录', entered)
 
   const openDir = (name) =>
     evaluate(
@@ -1034,13 +1082,13 @@ async function main() {
 
   await evaluate(cdp, `document.querySelector('[title^="上一级"]').click()`)
   await waitFor(cdp, `${CRUMBS} === '/'`, '返回上级')
-  check('返回上级目录', true)
+  await check('返回上级目录', true)
 
   // Breadcrumb navigation: clicking an ancestor jumps straight there.
   await openDir('tree')
   await waitFor(cdp, `${CRUMBS} === '/tree'`, '再次进入 /tree')
   await evaluate(cdp, `document.querySelector('.crumbs .crumb').click()`)
-  check('点面包屑回根目录', await waitFor(cdp, `${CRUMBS} === '/'`, '点面包屑回根目录'))
+  await check('点面包屑回根目录', await waitFor(cdp, `${CRUMBS} === '/'`, '点面包屑回根目录'))
 
   // Typing a path jumps directly.
   await evaluate(cdp, `document.querySelector('[title="输入路径跳转"]').click()`)
@@ -1054,7 +1102,7 @@ async function main() {
        return true
      })()`
   )
-  check('输入路径直接跳转', await waitFor(cdp, `${CRUMBS} === '/tree/a/b'`, '输入路径直接跳转'))
+  await check('输入路径直接跳转', await waitFor(cdp, `${CRUMBS} === '/tree/a/b'`, '输入路径直接跳转'))
   await evaluate(cdp, `document.querySelector('.crumbs .crumb').click()`)
   await waitFor(cdp, `${CRUMBS} === '/'`, '回到根目录')
 
@@ -1071,7 +1119,7 @@ async function main() {
     `[...document.querySelectorAll('.files-list .row')].some(r => r.textContent.includes('created-by-test'))`,
     '新建的目录出现在列表'
   )
-  check('通过界面新建目录 (MKDIR)', existsSync(join(sftpRoot, 'created-by-test')))
+  await check('通过界面新建目录 (MKDIR)', existsSync(join(sftpRoot, 'created-by-test')))
 
   // Recursive delete through the row context menu, exercising the walk. Plain
   // 删除 is RMDIR and would (correctly) refuse this non-empty directory.
@@ -1084,8 +1132,8 @@ async function main() {
        return true
      })()`
   )
-  check('文件右键菜单弹出', await evaluate(cdp, `!!document.querySelector('#menu')`))
-  check(
+  await check('文件右键菜单弹出', await evaluate(cdp, `!!document.querySelector('#menu')`))
+  await check(
     '文件菜单有上传/下载/打包/新建/权限/删除/递归删除/刷新',
     await evaluate(
       cdp,
@@ -1105,11 +1153,11 @@ async function main() {
       '删除后列表刷新'
     )
   ) {
-    check('删除后列表刷新', true)
+    await check('删除后列表刷新', true)
   }
-  check('删除确认框已弹出', dialogs >= 1, `dialogs=${dialogs}`)
-  check('递归删除目录及其嵌套文件 (RMDIR/REMOVE)', !existsSync(join(sftpRoot, 'tree')))
-  check('无关文件未被误删', existsSync(join(sftpRoot, 'hello.txt')))
+  await check('删除确认框已弹出', dialogs >= 1, `dialogs=${dialogs}`)
+  await check('递归删除目录及其嵌套文件 (RMDIR/REMOVE)', !existsSync(join(sftpRoot, 'tree')))
+  await check('无关文件未被误删', existsSync(join(sftpRoot, 'hello.txt')))
 
   /* ---------------- resource monitor ---------------- */
 
@@ -1128,7 +1176,7 @@ async function main() {
   if (
     await waitFor(cdp, `document.querySelector('.mon-host')?.textContent === 'smoke-host'`, '监控面板取到服务器信息')
   ) {
-    check('监控面板打开并读到主机名', true)
+    await check('监控面板打开并读到主机名', true)
   }
 
   // The level bars animate into place (0.15s), so measure them after they land.
@@ -1187,49 +1235,49 @@ async function main() {
     )
   )
 
-  check('仪表按 CPU/内存/Swap/网络 排列', mon.labels.join(',') === 'CPU,内存,Swap,网络', mon.labels.join(','))
-  check('CPU 百分比来自两次采样（110/310）', mon.cpu === '35%', mon.cpu)
-  check('内存按 MemAvailable 算并给出用量', mon.mem === '76%' && mon.memDetail === '12 GB / 16 GB', `${mon.mem} ${mon.memDetail}`)
-  check('Swap 用掉一半', mon.swap === '50%', mon.swap)
-  check('网速取两次采样的差值', mon.netDown === '↓ 12 KB/s' && mon.netUp === '↑ 4.7 KB/s', `${mon.netDown} ${mon.netUp}`)
+  await check('仪表按 CPU/内存/Swap/网络 排列', mon.labels.join(',') === 'CPU,内存,Swap,网络', mon.labels.join(','))
+  await check('CPU 百分比来自两次采样（110/310）', mon.cpu === '35%', mon.cpu)
+  await check('内存按 MemAvailable 算并给出用量', mon.mem === '76%' && mon.memDetail === '12 GB / 16 GB', `${mon.mem} ${mon.memDetail}`)
+  await check('Swap 用掉一半', mon.swap === '50%', mon.swap)
+  await check('网速取两次采样的差值', mon.netDown === '↓ 12 KB/s' && mon.netUp === '↑ 4.7 KB/s', `${mon.netDown} ${mon.netUp}`)
   // eth0's counters from the canned capture: 512000 / 204800 bytes.
-  check('每个网卡一行，速率和累计都分开', /eth0/.test(mon.netRows) && /↓500 KB/.test(mon.netRows) && /↑200 KB/.test(mon.netRows), mon.netRows)
-  check('延迟和累计流量写在仪表下面', /延迟/.test(mon.netMeta) && /累计/.test(mon.netMeta), mon.netMeta)
-  check('GPU 卡片显示编号/型号/温度/显存', /#0/.test(mon.gpu) && /Tesla T4/.test(mon.gpu) && /45°C/.test(mon.gpu) && /1\.0 GB \/ 15 GB/.test(mon.gpu), mon.gpu)
+  await check('每个网卡一行，速率和累计都分开', /eth0/.test(mon.netRows) && /↓500 KB/.test(mon.netRows) && /↑200 KB/.test(mon.netRows), mon.netRows)
+  await check('延迟和累计流量写在仪表下面', /延迟/.test(mon.netMeta) && /累计/.test(mon.netMeta), mon.netMeta)
+  await check('GPU 卡片显示编号/型号/温度/显存', /#0/.test(mon.gpu) && /Tesla T4/.test(mon.gpu) && /45°C/.test(mon.gpu) && /1\.0 GB \/ 15 GB/.test(mon.gpu), mon.gpu)
   // Reported bug: an unlabelled bar sat above the vram line, so the two looked
   // like they described each other. One labelled row, one number, one bar.
   // 1024/15360 = 6.7%, which is what the bar has to show.
-  check(
+  await check(
     '显存行有标签，条跟紧挨着的百分比一致',
     mon.gpuRow.label === '显存' && /^7%/.test(mon.gpuRow.text) && Math.abs(mon.gpuRow.bar - 7) <= 2,
     `${mon.gpuRow.bar}% vs 显示 ${mon.gpuRow.text}`
   )
   // The visible line is mount + bar + percent; the device file moved into the
   // hover title, so the tmpfs filter is checked there.
-  check('磁盘卡片按已用/总量算', mon.disk.includes('/73%') && mon.disk.includes('29 GB / 39 GB'), mon.disk)
-  check('磁盘滤掉 tmpfs，设备名在悬停里', mon.diskTitles.includes('/dev/sda1') && !mon.diskTitles.includes('/dev/shm'), mon.diskTitles)
-  check('服务器信息含主机名/内核/核心数/负载', /Linux 5\.15/.test(mon.info) && /8 核/.test(mon.info) && /负载 0\.52/.test(mon.info), mon.info)
-  check('三条曲线（CPU/内存/网络）已绘制', mon.sparks === 3, `sparks=${mon.sparks}`)
+  await check('磁盘卡片按已用/总量算', mon.disk.includes('/73%') && mon.disk.includes('29 GB / 39 GB'), mon.disk)
+  await check('磁盘滤掉 tmpfs，设备名在悬停里', mon.diskTitles.includes('/dev/sda1') && !mon.diskTitles.includes('/dev/shm'), mon.diskTitles)
+  await check('服务器信息含主机名/内核/核心数/负载', /Linux 5\.15/.test(mon.info) && /8 核/.test(mon.info) && /负载 0\.52/.test(mon.info), mon.info)
+  await check('三条曲线（CPU/内存/网络）已绘制', mon.sparks === 3, `sparks=${mon.sparks}`)
   // A canvas in the DOM proves nothing — the first sample used to draw a lone dot
   // in the corner, i.e. a card that looked empty.
-  check('第一条采样就有可见的曲线', mon.painted.split(',').every((n) => Number(n) > 40), mon.painted)
+  await check('第一条采样就有可见的曲线', mon.painted.split(',').every((n) => Number(n) > 40), mon.painted)
   // Within a couple of points: the fill is a percentage of a fractional pixel
   // width. 网络 has no bar at all, hence the -1.
   const fills = mon.fills.split(',').map(Number)
-  check(
+  await check(
     '进度条长度和数字对得上',
     [35, 76, 50].every((want, i) => Math.abs(fills[i] - want) <= 2) && fills[3] === -1,
     `CPU/内存/Swap/网络 = ${mon.fills}`
   )
-  check('一切正常时预警条是绿的', mon.alertTone === 'ok' && mon.alerts.includes('正常范围'), `${mon.alertTone} ${mon.alerts}`)
-  check('监控面板一屏看完，不用下拉', mon.scroll <= mon.client + 2, `${mon.scroll} / ${mon.client}`)
-  check('监控走的是独立的 exec 通道', execCount > 0, `execCount=${execCount}`)
+  await check('一切正常时预警条是绿的', mon.alertTone === 'ok' && mon.alerts.includes('正常范围'), `${mon.alertTone} ${mon.alerts}`)
+  await check('监控面板一屏看完，不用下拉', mon.scroll <= mon.client + 2, `${mon.scroll} / ${mon.client}`)
+  await check('监控走的是独立的 exec 通道', execCount > 0, `execCount=${execCount}`)
 
   // Polling must stop when the panel is closed, not keep running in the background.
   await ensureMon(false)
   const before = execCount
   await sleep(3200)
-  check('关闭面板后停止采样', execCount === before, `${before} -> ${execCount}`)
+  await check('关闭面板后停止采样', execCount === before, `${before} -> ${execCount}`)
 
   /* ---------------- upload + transfer list ---------------- */
 
@@ -1249,28 +1297,28 @@ async function main() {
     `document.querySelector('.xfer .xfer-pct')?.textContent === '完成'`,
     '上传进度行出现并转为完成'
   )
-  check('上传进度行出现并转为完成', uploaded)
-  check(
+  await check('上传进度行出现并转为完成', uploaded)
+  await check(
     '进度条走到 100%',
     (await evaluate(cdp, `document.querySelector('.xfer .pbar-fill').style.width`)) === '100%'
   )
   // The arrow is the direction at a glance; the name is what was uploaded.
-  check(
+  await check(
     '上传清单显示文件名与已完成状态',
     (await evaluate(
       cdp,
       `document.querySelector('.xfer .xfer-name').textContent + '|' + document.querySelector('.xfer-count').textContent`
     )) === '↑ dropped.bin|1 项'
   )
-  check('文件确实写到了远端', existsSync(join(sftpRoot, 'dropped.bin')))
-  check(
+  await check('文件确实写到了远端', existsSync(join(sftpRoot, 'dropped.bin')))
+  await check(
     '远端内容与源文件等长',
     existsSync(join(sftpRoot, 'dropped.bin')) && statOf(join(sftpRoot, 'dropped.bin')).size === 300 * 1024
   )
 
   await evaluate(cdp, `[...document.querySelectorAll('.xfer-head-bar .tbtn')].find(b => b.textContent === '清除已完成').click()`)
   await waitFor(cdp, `document.querySelector('.transfers').style.display === 'none'`, '上传清单已收起')
-  check('清除已完成后清单收起', (await evaluate(cdp, `document.querySelectorAll('.xfer').length`)) === 0)
+  await check('清除已完成后清单收起', (await evaluate(cdp, `document.querySelectorAll('.xfer').length`)) === 0)
 
   /* ---------------- built-in editor ---------------- */
 
@@ -1298,7 +1346,7 @@ async function main() {
   await waitFor(cdp, `!!${rowOf('app.conf')}`, '新文件出现在列表')
   await dblclickRow('app.conf')
   if (await waitFor(cdp, `!!document.querySelector('.editor-win')`, '双击文本文件打开内置编辑器')) {
-    check('双击文本文件打开内置编辑器', true)
+    await check('双击文本文件打开内置编辑器', true)
   }
   const opened = JSON.parse(
     await evaluate(
@@ -1310,8 +1358,8 @@ async function main() {
        })`
     )
   )
-  check('编辑器载入远端内容与路径', opened.text === 'port = 80\n' && opened.path === '/app.conf', JSON.stringify(opened))
-  check('刚打开时标记为已同步', opened.state === '已同步', opened.state)
+  await check('编辑器载入远端内容与路径', opened.text === 'port = 80\n' && opened.path === '/app.conf', JSON.stringify(opened))
+  await check('刚打开时标记为已同步', opened.state === '已同步', opened.state)
 
   await evaluate(
     cdp,
@@ -1322,19 +1370,19 @@ async function main() {
        return true
      })()`
   )
-  check('改动后标记为未保存', (await evaluate(cdp, `document.querySelector('.editor-state').textContent`)) === '● 未保存')
+  await check('改动后标记为未保存', (await evaluate(cdp, `document.querySelector('.editor-state').textContent`)) === '● 未保存')
   await clickHead('保存')
   if (await waitFor(cdp, `document.querySelector('.editor-state')?.textContent?.startsWith('已保存')`, '保存后回显成功')) {
-    check('保存后回显成功', true)
+    await check('保存后回显成功', true)
   }
-  check('保存真的写回了远端 (WRITE + SETSTAT + RENAME)', await diskIs(confPath, 'port = 8080\n'), readFileSync(confPath, 'utf8'))
-  check('没有留下临时文件', !existsSync(`${confPath}.liteshell.tmp`))
+  await check('保存真的写回了远端 (WRITE + SETSTAT + RENAME)', await diskIs(confPath, 'port = 8080\n'), readFileSync(confPath, 'utf8'))
+  await check('没有留下临时文件', !existsSync(`${confPath}.liteshell.tmp`))
   await waitFor(
     cdp,
     `${rowOf('app.conf')}?.querySelector('.sz').textContent === '12 B'`,
     '保存后列表刷新出新大小'
   )
-  check(
+  await check(
     '保存后列表按新内容刷新大小',
     (await evaluate(cdp, `${rowOf('app.conf')}?.querySelector('.sz')?.textContent`)) === '12 B'
   )
@@ -1357,25 +1405,25 @@ async function main() {
   // Without the prompt the write is refused, so the file would keep the other
   // writer's content and this poll times out.
   const forced = await diskIs(confPath, 'port = 9090\n')
-  check('远端被改过时先弹确认再覆盖', dialogs > staleDialogs, `dialogs=${dialogs}`)
-  check('确认后强制写入成功', forced, readFileSync(confPath, 'utf8'))
+  await check('远端被改过时先弹确认再覆盖', dialogs > staleDialogs, `dialogs=${dialogs}`)
+  await check('确认后强制写入成功', forced, readFileSync(confPath, 'utf8'))
 
   await clickHead('关闭')
-  check('关闭按钮收起编辑器', await waitFor(cdp, `!document.querySelector('.editor-win')`, '编辑器已关闭'))
+  await check('关闭按钮收起编辑器', await waitFor(cdp, `!document.querySelector('.editor-win')`, '编辑器已关闭'))
 
   // A binary file must never reach the editor.
   acceptDialogs = false
   const pngDialogs = dialogs
   await dblclickRow('photo.png')
   if (await waitFor(cdp, `document.querySelector('#status-text')?.textContent?.startsWith('已跳过 photo.png')`, '二进制文件被挡下')) {
-    check('二进制文件被挡下', true)
+    await check('二进制文件被挡下', true)
   }
-  check('没有为二进制文件开编辑器', !(await evaluate(cdp, `!!document.querySelector('.editor-win')`)))
-  check(
+  await check('没有为二进制文件开编辑器', !(await evaluate(cdp, `!!document.querySelector('.editor-win')`)))
+  await check(
     '拒绝理由来自扩展名规则',
     /压缩包或二进制/.test(await evaluate(cdp, `document.querySelector('#status-text').textContent`))
   )
-  check('挡下之前问过用户是否改用本机程序', dialogs > pngDialogs, `dialogs=${dialogs}`)
+  await check('挡下之前问过用户是否改用本机程序', dialogs > pngDialogs, `dialogs=${dialogs}`)
   acceptDialogs = true
 
   /* ---------------- file-type colors ---------------- */
@@ -1404,12 +1452,12 @@ async function main() {
        })()`
     )
   )
-  check('目录与文件颜色不同', colors.dir !== colors.text, JSON.stringify(colors))
-  check('可执行脚本是绿的', colors.exec === 'rgb(63, 185, 80)', colors.exec)
-  check('压缩包是红的', colors.archive === 'rgb(229, 83, 75)', colors.archive)
-  check('图片是紫的', colors.media === 'rgb(188, 140, 255)', colors.media)
-  check('配置/代码是青的', colors.code === 'rgb(57, 197, 207)', colors.code)
-  check('普通文本保持默认色', colors.text === 'rgb(201, 209, 221)', colors.text)
+  await check('目录与文件颜色不同', colors.dir !== colors.text, JSON.stringify(colors))
+  await check('可执行脚本是绿的', colors.exec === 'rgb(63, 185, 80)', colors.exec)
+  await check('压缩包是红的', colors.archive === 'rgb(229, 83, 75)', colors.archive)
+  await check('图片是紫的', colors.media === 'rgb(188, 140, 255)', colors.media)
+  await check('配置/代码是青的', colors.code === 'rgb(57, 197, 207)', colors.code)
+  await check('普通文本保持默认色', colors.text === 'rgb(201, 209, 221)', colors.text)
 
   /* ---------------- text you can actually copy ---------------- */
 
@@ -1423,9 +1471,9 @@ async function main() {
        })`
     )
   )
-  check('文件行可以选中复制', selectable.row === 'text', JSON.stringify(selectable))
-  check('监控信息可以选中复制', selectable.info === 'text', JSON.stringify(selectable))
-  check('按钮不回应用户选择', selectable.btn === 'none', JSON.stringify(selectable))
+  await check('文件行可以选中复制', selectable.row === 'text', JSON.stringify(selectable))
+  await check('监控信息可以选中复制', selectable.info === 'text', JSON.stringify(selectable))
+  await check('按钮不回应用户选择', selectable.btn === 'none', JSON.stringify(selectable))
 
   // Anything dragged over gets a one-click trip to the clipboard. (Not the
   // terminal: xterm keeps its own selection and hides the DOM one.)
@@ -1442,7 +1490,7 @@ async function main() {
        return [...document.querySelectorAll('#menu div')].map(d => d.textContent).join('|')
      })()`
   )
-  check('选中文本后菜单里有「复制选中内容」', /复制选中内容/.test(menuAfterSelect), menuAfterSelect)
+  await check('选中文本后菜单里有「复制选中内容」', /复制选中内容/.test(menuAfterSelect), menuAfterSelect)
   await evaluate(
     cdp,
     `(() => {
@@ -1456,7 +1504,7 @@ async function main() {
 
   await evaluate(cdp, `[...document.querySelectorAll('.tbtn')].find(b => b.textContent === '查找').click()`)
   await waitFor(cdp, `!!document.querySelector('.find-input')`, '查找框出现')
-  check(
+  await check(
     '查找框不是一条长条',
     (await evaluate(cdp, `Math.round(document.querySelector('.find-input').getBoundingClientRect().width)`)) <= 240
   )
@@ -1464,13 +1512,13 @@ async function main() {
 
   await evaluate(cdp, `document.querySelector('#btn-keys').click()`)
   if (await waitFor(cdp, `document.querySelectorAll('.key-row').length >= 10`, '标题栏能直接打开快捷键一览')) {
-    check('标题栏能直接打开快捷键一览', true)
+    await check('标题栏能直接打开快捷键一览', true)
   }
-  check(
+  await check(
     '快捷键一览分「应用」和「终端」两段',
     (await evaluate(cdp, `document.querySelectorAll('.keys-title').length`)) === 2
   )
-  check(
+  await check(
     '内置快捷键表包含编辑器与常用 shell 键',
     /Ctrl \+ S/.test(await evaluate(cdp, `[...document.querySelectorAll('.keys kbd')].map(k => k.textContent).join('|')`)) &&
       /Ctrl \+ R/.test(await evaluate(cdp, `[...document.querySelectorAll('.keys kbd')].map(k => k.textContent).join('|')`))
@@ -1482,9 +1530,9 @@ async function main() {
 
   await evaluate(cdp, `document.querySelector('#btn-keyring').click()`)
   if (await waitFor(cdp, `document.querySelectorAll('.key-item').length === 1`, '私钥管理列出已归档的密钥')) {
-    check('私钥管理列出已归档的密钥', true)
+    await check('私钥管理列出已归档的密钥', true)
   }
-  check(
+  await check(
     '私钥行显示名称、备注与路径',
     (await evaluate(cdp, `document.querySelector('.key-item .key-name').textContent`)) === '冒烟密钥' &&
       (await evaluate(cdp, `document.querySelector('.key-item .key-path').textContent`)).includes('本地测试')
@@ -1504,12 +1552,12 @@ async function main() {
   )
   await sleep(300)
   const keySaved = JSON.parse(readFileSync(join(profile, 'liteshell.json'), 'utf8'))
-  check(
+  await check(
     '私钥改名与备注落盘',
     keySaved.keys?.[0]?.name === '生产跳板机' && keySaved.keys?.[0]?.comment === '只给 prod 用',
     JSON.stringify(keySaved.keys)
   )
-  check(
+  await check(
     '保存后回到列表并刷新',
     await waitFor(cdp, `document.querySelector('.key-item .key-name')?.textContent === '生产跳板机'`, '列表刷新')
   )
@@ -1526,7 +1574,7 @@ async function main() {
        return [...document.querySelectorAll('#menu > div')].map(d => d.textContent).join('|')
      })()`
   )
-  check(
+  await check(
     '目录右键有导入与导出',
     /导入 FinalShell 连接文件/.test(folderMenu) && /导出此文件夹/.test(folderMenu),
     folderMenu
@@ -1541,7 +1589,7 @@ async function main() {
        return [...document.querySelectorAll('#menu > div')].map(d => d.textContent).join('|')
      })()`
   )
-  check('连接右键有配置免密登录', /配置本机免密登录/.test(connMenu), connMenu)
+  await check('连接右键有配置免密登录', /配置本机免密登录/.test(connMenu), connMenu)
   await evaluate(cdp, `document.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))`)
 
   /* ---------------- pick a key in the connection editor ---------------- */
@@ -1564,17 +1612,17 @@ async function main() {
   }
 
   await openEditor('local-smoke')
-  check('私钥下拉自动选中连接已有的密钥', (await evaluate(cdp, `${KEY_SELECT}?.value`)) === libraryKey)
-  check(
+  await check('私钥下拉自动选中连接已有的密钥', (await evaluate(cdp, `${KEY_SELECT}?.value`)) === libraryKey)
+  await check(
     '下拉里列的是密钥名称而不是路径',
     (await evaluate(cdp, `${KEY_SELECT}?.selectedOptions[0].textContent`)).startsWith('生产跳板机 — '),
     await evaluate(cdp, `${KEY_SELECT}?.selectedOptions[0].textContent`)
   )
-  check(
+  await check(
     '选中项下方给出实际路径',
     (await evaluate(cdp, `document.querySelector('.modal .key-path').textContent`)) === libraryKey
   )
-  check(
+  await check(
     '编辑面板提供导入与浏览',
     (await evaluate(cdp, `[...document.querySelectorAll('.modal .row-inline .btn')].map(b => b.textContent).join('|')`)) ===
       '导入|浏览'
@@ -1584,7 +1632,7 @@ async function main() {
   await evaluate(cdp, `[...document.querySelectorAll('.modal footer .btn')].find(b => b.textContent === '保存').click()`)
   await sleep(400)
   const afterSave = JSON.parse(readFileSync(join(profile, 'liteshell.json'), 'utf8'))
-  check(
+  await check(
     '原样保存不会丢掉私钥路径',
     afterSave.connections.find((c) => c.id === 'smoke')?.privateKeyPath === libraryKey,
     JSON.stringify(afterSave.connections.find((c) => c.id === 'smoke')?.privateKeyPath)
@@ -1592,7 +1640,7 @@ async function main() {
 
   // A path outside the library must survive too — that is the imported/hand-typed case.
   await openEditor('local-loose')
-  check(
+  await check(
     '不在私钥库的路径仍然保留为可选项',
     (await evaluate(cdp, `${KEY_SELECT}?.selectedOptions[0].textContent`)).includes('不在私钥库'),
     await evaluate(cdp, `${KEY_SELECT}?.selectedOptions[0].textContent`)
@@ -1600,7 +1648,7 @@ async function main() {
   await evaluate(cdp, `[...document.querySelectorAll('.modal footer .btn')].find(b => b.textContent === '保存').click()`)
   await sleep(400)
   const looseSave = JSON.parse(readFileSync(join(profile, 'liteshell.json'), 'utf8'))
-  check(
+  await check(
     '不在库里的路径原样保住',
     looseSave.connections.find((c) => c.id === 'loose')?.privateKeyPath === looseKeyPath,
     JSON.stringify(looseSave.connections.find((c) => c.id === 'loose')?.privateKeyPath)
@@ -1610,12 +1658,12 @@ async function main() {
 
   await evaluate(cdp, `document.querySelector('#btn-quick').click()`)
   if (await waitFor(cdp, `document.querySelectorAll('.pal-item').length > 50`, '命令面板列出内置命令')) {
-    check('命令面板列出内置命令', true)
+    await check('命令面板列出内置命令', true)
   }
   const palCount = await evaluate(cdp, `document.querySelectorAll('.pal-item').length`)
-  check('内置命令数量够多', palCount >= 100, `${palCount} 条`)
-  check('面板按分组分段', (await evaluate(cdp, `document.querySelectorAll('.palette .keys-title').length`)) >= 8)
-  check(
+  await check('内置命令数量够多', palCount >= 100, `${palCount} 条`)
+  await check('面板按分组分段', (await evaluate(cdp, `document.querySelectorAll('.palette .keys-title').length`)) >= 8)
+  await check(
     '每条命令都配中文说明',
     await evaluate(cdp, `[...document.querySelectorAll('.pal-hint')].every(h => h.textContent.trim().length > 1)`)
   )
@@ -1633,13 +1681,13 @@ async function main() {
 
   await typeInPalette('显存')
   const filtered = await evaluate(cdp, `[...document.querySelectorAll('.pal-item code')].map(c => c.textContent).join('|')`)
-  check('按说明搜索能筛出命令', filtered.includes('nvidia-smi'), filtered)
-  check('过滤后条数变少', (await evaluate(cdp, `document.querySelectorAll('.pal-item').length`)) < palCount)
+  await check('按说明搜索能筛出命令', filtered.includes('nvidia-smi'), filtered)
+  await check('过滤后条数变少', (await evaluate(cdp, `document.querySelectorAll('.pal-item').length`)) < palCount)
 
   await typeInPalette('')
   await evaluate(cdp, `[...document.querySelectorAll('.pal-item')].find(r => r.textContent.startsWith('free -h')).click()`)
-  check('点选后命令面板关闭', await waitFor(cdp, `document.querySelector('#overlay').hidden`, '命令面板关闭'))
-  check(
+  await check('点选后命令面板关闭', await waitFor(cdp, `document.querySelector('#overlay').hidden`, '命令面板关闭'))
+  await check(
     '命令被填进输入行而不是直接执行',
     await waitFor(cdp, `document.querySelector('.xterm-rows')?.textContent?.includes('free -h')`, '命令填入输入行')
   )
@@ -1650,14 +1698,14 @@ async function main() {
   const themeBefore = await evaluate(cdp, `getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()`)
   await evaluate(cdp, `document.querySelector('#btn-theme').click()`)
   if (await waitFor(cdp, `document.querySelectorAll('.theme-card').length >= 6`, '主题面板列出多个主题')) {
-    check('主题面板列出多个主题', true)
+    await check('主题面板列出多个主题', true)
   }
   await evaluate(cdp, `document.querySelector('.theme-card[data-theme-key="paper"]').click()`)
   // pickTheme persists first, so the recolor lands a tick after the click.
   await waitFor(cdp, `document.body.dataset.theme === 'paper'`, '主题切换已生效')
   const themeAfter = await evaluate(cdp, `getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()`)
-  check('切换主题会改掉界面底色', themeBefore !== themeAfter, `${themeBefore} -> ${themeAfter}`)
-  check('亮色主题把 chrome 也切了', (await evaluate(cdp, `document.body.dataset.chrome`)) === 'light')
+  await check('切换主题会改掉界面底色', themeBefore !== themeAfter, `${themeBefore} -> ${themeAfter}`)
+  await check('亮色主题把 chrome 也切了', (await evaluate(cdp, `document.body.dataset.chrome`)) === 'light')
   await evaluate(
     cdp,
     `[...document.querySelectorAll('#overlay .modal footer .btn')].find(b => b.textContent === '完成').click()`
@@ -1688,9 +1736,9 @@ async function main() {
       '密码认证连接弹出补录密码框'
     )
   ) {
-    check('无密码的连接会先问密码，而不是空密码硬连', true)
+    await check('无密码的连接会先问密码，而不是空密码硬连', true)
   }
-  check(
+  await check(
     '密码框标题带上目标主机',
     /smoke@127\.0\.0\.1/.test(await evaluate(cdp, `document.querySelector('#overlay .modal .field label').textContent`))
   )
@@ -1709,13 +1757,13 @@ async function main() {
       '密码错误时给出失败提示'
     )
   ) {
-    check('认证失败会新建标签页并提示错误', true)
+    await check('认证失败会新建标签页并提示错误', true)
   }
   if (process.env.SMOKE_DEBUG) {
     await evaluate(cdp, `document.querySelector('#btn-log').click()`)
     console.log('DEBUG\n' + (await evaluate(cdp, `document.querySelector('.log-view').textContent`)))
   }
-  check(
+  await check(
     '错误提示内容非空',
     (await evaluate(cdp, `document.querySelector('.notice.error').textContent.length`)) > 10
   )
@@ -1723,17 +1771,17 @@ async function main() {
   // The log has to carry both the connection attempt and the failure.
   await evaluate(cdp, `document.querySelector('#btn-log').click()`)
   if (await waitFor(cdp, `!!document.querySelector('.log-view')`, '日志面板打开')) {
-    check('日志面板可打开', true)
+    await check('日志面板可打开', true)
   }
   const logText = await evaluate(cdp, `document.querySelector('.log-view').textContent`)
-  check('日志记录了连接尝试', /连接 smoke@127\.0\.0\.1:\d+（password）/.test(logText))
-  check('日志记录了失败原因', /连接失败：/.test(logText))
-  check('日志记录了 SSH 握手细节', /\[local-pw\]/.test(logText))
+  await check('日志记录了连接尝试', /连接 smoke@127\.0\.0\.1:\d+（password）/.test(logText))
+  await check('日志记录了失败原因', /连接失败：/.test(logText))
+  await check('日志记录了 SSH 握手细节', /\[local-pw\]/.test(logText))
   await evaluate(
     cdp,
     `[...document.querySelectorAll('#overlay .modal footer .btn')].find(b => b.textContent === '关闭').click()`
   )
-  check('日志面板可关闭', await evaluate(cdp, `document.querySelector('#overlay').hidden`))
+  await check('日志面板可关闭', await evaluate(cdp, `document.querySelector('#overlay').hidden`))
 
   /* ---------------- CLI：agent 走的就是这条路 ---------------- */
 
@@ -1766,7 +1814,7 @@ async function main() {
   // the one just exercised, this test would be vouching for the wrong file.
   const installedCli = join(homedir(), '.claude', 'skills', 'liteshell', 'bin', 'liteshell-cli.mjs')
   if (existsSync(installedCli)) {
-    check(
+    await check(
       '技能目录里装的那份 CLI 和仓库这份一致',
       readFileSync(installedCli, 'utf8') === readFileSync(CLI, 'utf8'),
       '把 skills/liteshell 重新复制到 ~/.claude/skills/'
@@ -1774,7 +1822,7 @@ async function main() {
   }
 
   const listed = await cli('conns')
-  check(
+  await check(
     'CLI 列出可用连接，且不带出私钥路径',
     listed.json?.ok === true &&
       listed.json.connections?.some((c) => c.name === 'local-smoke' && c.host === '127.0.0.1') &&
@@ -1785,7 +1833,7 @@ async function main() {
   const tabsBeforeCli = await evaluate(cdp, `document.querySelectorAll('.tab').length`)
   const connsBeforeCli = connCount
   const ran = await cli('exec', 'local-smoke', 'echo CLI_MARK')
-  check(
+  await check(
     'CLI 跑通一条命令，stdout/stderr/退出码各归各位',
     ran.json?.ok === true &&
       ran.json.stdout.trim() === 'ran:echo CLI_MARK' &&
@@ -1795,8 +1843,8 @@ async function main() {
   )
   // The whole point of the exit-status split: a command that ran and failed is
   // success for the tooling, and the caller reads `code`.
-  check('远端退出码是数据不是失败，CLI 自己仍退 0', ran.status === 0, `exit=${ran.status}`)
-  check(
+  await check('远端退出码是数据不是失败，CLI 自己仍退 0', ran.status === 0, `exit=${ran.status}`)
+  await check(
     'CLI 的会话在界面上开了标签页，用户能看着',
     (await evaluate(cdp, `document.querySelectorAll('.tab').length`)) === tabsBeforeCli + 1,
     `tabs ${tabsBeforeCli} -> ${await evaluate(cdp, `document.querySelectorAll('.tab').length`)}`
@@ -1804,20 +1852,20 @@ async function main() {
   // Asked for by id this time: both ways of naming a connection have to land on the
   // same live session, not a second handshake.
   const again = await cli('exec', 'smoke', 'echo CLI_MARK')
-  check('用 id 也能找到同一条连接', again.json?.ok === true, JSON.stringify(again.json))
-  check('第二次调用复用同一条连接，不再握手', connCount === connsBeforeCli + 1, `connections=${connCount}`)
+  await check('用 id 也能找到同一条连接', again.json?.ok === true, JSON.stringify(again.json))
+  await check('第二次调用复用同一条连接，不再握手', connCount === connsBeforeCli + 1, `connections=${connCount}`)
 
   const cliMon = await cli('monitor', 'local-smoke')
-  check(
+  await check(
     'CLI 拿到的是结构化资源快照',
     cliMon.json?.ok === true && Math.round(cliMon.json.snapshot?.cpu) === 35,
     JSON.stringify(cliMon.json?.snapshot?.cpu)
   )
 
   const made = await cli('mkdir', 'local-smoke', '/cli-made')
-  check('CLI 能在远端建目录', made.json?.ok === true && existsSync(join(sftpRoot, 'cli-made')), made.raw.trim())
+  await check('CLI 能在远端建目录', made.json?.ok === true && existsSync(join(sftpRoot, 'cli-made')), made.raw.trim())
   const listing = await cli('ls', 'local-smoke', '/')
-  check(
+  await check(
     'CLI 列目录看得到刚建的目录',
     !!listing.json?.entries?.some((e) => e.name === 'cli-made' && e.isDir),
     JSON.stringify(listing.json?.entries?.map((e) => e.name))
@@ -1826,19 +1874,19 @@ async function main() {
   const localFile = join(work, 'cli-upload.txt')
   writeFileSync(localFile, 'hello from cli\n')
   const put = await cli('put', 'local-smoke', localFile, '/')
-  check('CLI 上传文件', put.json?.ok === true && existsSync(join(sftpRoot, 'cli-upload.txt')), put.raw.trim())
+  await check('CLI 上传文件', put.json?.ok === true && existsSync(join(sftpRoot, 'cli-upload.txt')), put.raw.trim())
   const back = await cli('cat', 'local-smoke', '/cli-upload.txt')
-  check('CLI 读回远端文本', back.json?.ok === true && back.json.text === 'hello from cli\n', JSON.stringify(back.json))
+  await check('CLI 读回远端文本', back.json?.ok === true && back.json.text === 'hello from cli\n', JSON.stringify(back.json))
   const removed = await cli('rm', 'local-smoke', '/cli-made', '--isDir')
-  check('CLI 删除远端目录', removed.json?.ok === true && !existsSync(join(sftpRoot, 'cli-made')), removed.raw.trim())
+  await check('CLI 删除远端目录', removed.json?.ok === true && !existsSync(join(sftpRoot, 'cli-made')), removed.raw.trim())
 
   const bogus = await cli('exec', 'no-such-host', 'id')
-  check(
+  await check(
     '连接名不存在时给出错误码和可用连接列表',
     bogus.json?.ok === false && bogus.json.error_code === 'unknown_connection' && Array.isArray(bogus.json.connections),
     JSON.stringify(bogus.json)
   )
-  check('失败时退出码非 0', bogus.status === 1, `exit=${bogus.status}`)
+  await check('失败时退出码非 0', bogus.status === 1, `exit=${bogus.status}`)
 
   /* ---------------- AI 面板：从一句人话到一条真跑过的命令 ---------------- */
 
@@ -1873,70 +1921,78 @@ async function main() {
       `[...document.querySelectorAll('.pane.active .agent-ask:not(.answered) .agent-btn')].find(b => b.textContent === ${JSON.stringify(label)}).click()`
     )
 
-  check('当前标签页就是刚才 CLI 用的那条连接',
+  await check('当前标签页就是刚才 CLI 用的那条连接',
     (await evaluate(cdp, `document.querySelector('.tab.active .label')?.textContent`)) === 'local-smoke')
-  check('还没配任何东西也看得见 AI 入口', (await evaluate(cdp, `!!document.querySelector('${AI_BTN}')`)) === true)
+  await check('还没配任何东西也看得见 AI 入口', (await evaluate(cdp, `!!document.querySelector('${AI_BTN}')`)) === true)
 
   // The first-run path, exactly as a new user walks it: the panel says what it
   // needs and hands over the button that gets it.
   const urlBox = `[...document.querySelectorAll('#overlay .modal input')].find(i => i.value.startsWith('http') || i.placeholder.includes('/v1'))`
   const modelBox = `[...document.querySelectorAll('#overlay .modal input[list=llm-models]')][0]`
+  /** The vendor preset select, found by an option only it has. */
+  const vendorPick = (label) =>
+    `[...document.querySelectorAll('#overlay .modal select')].find(s => [...s.options].some(o => o.textContent === ${JSON.stringify(label)}))`
   const save = `[...document.querySelectorAll('#overlay .modal footer .btn')].find(b => b.textContent === '保存').click()`
   const llmState = async () => (await evaluate(cdp, `window.api.getStore().then(s => s.settings.llm)`)) ?? {}
 
   await evaluate(cdp, `document.querySelector('${AI_BTN}').click()`)
-  check('没配置时面板明说要什么，而不是空白',
+  await check('没配置时面板明说要什么，而不是空白',
     await waitFor(cdp, `${shown('.pane.active .agent-setup')} && !${shown('.pane.active .agent-compose')}`, '未配置状态'))
-  check('没配好时对话区不占着地方', (await evaluate(cdp, `${shown('.pane.active .agent-log')}`)) === false)
+  await check('没配好时对话区不占着地方', (await evaluate(cdp, `${shown('.pane.active .agent-log')}`)) === false)
   await evaluate(cdp, `document.querySelector('.pane.active .agent-setup .agent-btn').click()`)
-  check('面板里的按钮直接打开设置', await waitFor(cdp, `!!document.querySelector('#overlay .modal input[type=password]')`, '设置里有 AI 字段'))
+  await check('面板里的按钮直接打开设置', await waitFor(cdp, `!!document.querySelector('#overlay .modal input[type=password]')`, '设置里有 AI 字段'))
 
   // The address goes in first, then the model comes from the endpoint — the
   // path that avoids typing a model name from memory and getting a 404.
   // Addressed the way a person addresses a gateway — host and port, no /v1.
   // The lookup has to work anyway, and it has to say the box was fixed.
+  await evaluate(cdp, `(() => {
+    const sel = ${vendorPick('自定义 / 中转网关')}
+    sel.value = 'custom'
+    sel.dispatchEvent(new Event('change', { bubbles: true }))
+  })()`)
   await evaluate(cdp, `(() => { const el = ${urlBox}; el.value = 'http://127.0.0.1:${LLM_PORT}' })()`)
   await evaluate(cdp, `[...document.querySelectorAll('#overlay .modal button')].find(b => b.textContent === '拉取模型').click()`)
-  check('模型列表从接口拉回来，不用自己背模型名',
+  await check('模型列表从接口拉回来，不用自己背模型名',
     await waitFor(cdp, `document.querySelectorAll('#llm-models option').length === 2 && ${modelBox}.value === 'smoke-model'`, '拉到模型列表'),
     await evaluate(cdp, `JSON.stringify({ n: document.querySelectorAll('#llm-models option').length, v: ${modelBox}.value, note: document.querySelector('#overlay .modal .llm-note').textContent })`))
-  check('地址少了 /v1 时自己补上，并且说出来补了',
+  await check('地址少了 /v1 时自己补上，并且说出来补了',
     (await evaluate(cdp, `document.querySelector('#overlay .modal .llm-note').textContent`)).includes('地址少了 /v1') &&
       (await evaluate(cdp, `${urlBox}.value`)) === `http://127.0.0.1:${LLM_PORT}/v1`,
     await evaluate(cdp, `document.querySelector('#overlay .modal .llm-note').textContent`))
-  check('拉到几个也告诉了用户',
+  await check('拉到几个也告诉了用户',
     (await evaluate(cdp, `document.querySelector('#overlay .modal .llm-note').textContent`)).includes('拉到 2 个模型'))
 
   await evaluate(cdp, save)
-  check('只填地址和模型、不填 key 也算配好了',
+  await check('只填地址和模型、不填 key 也算配好了',
     await waitFor(cdp, `!${shown('.pane.active .agent-setup')} && ${shown('.pane.active .agent-compose')}`, '面板就绪'))
-  check('配好之后那句「还没配置模型接口」真的不在屏幕上',
+  await check('配好之后那句「还没配置模型接口」真的不在屏幕上',
     (await evaluate(cdp, `!${shown('.pane.active .agent-setup')} && ${shown('.pane.active .agent-log')}`)) === true)
-  check('没有附件时那一行不占位置', (await evaluate(cdp, `!${shown('.pane.active .agent-files')}`)) === true)
-  check('这条就绪状态确实没靠 key 撑', (await llmState()).hasKey !== true)
+  await check('没有附件时那一行不占位置', (await evaluate(cdp, `!${shown('.pane.active .agent-files')}`)) === true)
+  await check('这条就绪状态确实没靠 key 撑', (await llmState()).hasKey !== true)
 
   // Now the key, which is optional but has to survive being left blank later.
   await evaluate(cdp, `document.querySelector('#btn-settings').click()`)
   await waitFor(cdp, `!!document.querySelector('#overlay .modal input[type=password]')`, '再开设置')
   // Reopening has to show what was saved — address and model are two fields,
   // and both of them are the user's to see and change.
-  check('设置里那两个框还在（地址、模型分开填）',
+  await check('设置里那两个框还在（地址、模型分开填）',
     (await evaluate(cdp, `${urlBox}.value`)) === `http://127.0.0.1:${LLM_PORT}/v1` &&
       (await evaluate(cdp, `${modelBox}.value`)) === 'smoke-model',
     await evaluate(cdp, `JSON.stringify([...document.querySelectorAll('#overlay .modal input')].map(i => i.value))`))
 
   await evaluate(cdp, `document.querySelector('#overlay .modal input[type=password]').value = 'smoke-key'`)
   await evaluate(cdp, save)
-  check('保存后设置自己关掉', await waitFor(cdp, `document.querySelector('#overlay').hidden`, '设置关闭'))
-  check('key 填了就存下来', (await llmState()).hasKey === true, JSON.stringify(await llmState()))
+  await check('保存后设置自己关掉', await waitFor(cdp, `document.querySelector('#overlay').hidden`, '设置关闭'))
+  await check('key 填了就存下来', (await llmState()).hasKey === true, JSON.stringify(await llmState()))
 
   // Reading it is half the feature: the panel has to be wide enough for a
   // command and its output, and able to take the whole pane when it needs it.
-  check('AI 面板比终端时代默认宽得多',
+  await check('AI 面板比终端时代默认宽得多',
     (await evaluate(cdp, `document.querySelector('.pane.active .agent').getBoundingClientRect().width`)) >= 500)
   const wideBtn = `document.querySelector('.pane.active .agent-wide')`
   await evaluate(cdp, `${wideBtn}.click()`)
-  check('⤢ 之后终端让位，面板真的占满',
+  await check('⤢ 之后终端让位，面板真的占满',
     await waitFor(cdp, `!${shown('.pane.active .term-box')}`, '终端让位') &&
       (await evaluate(cdp, `(() => {
         const a = document.querySelector('.pane.active .agent').getBoundingClientRect()
@@ -1946,32 +2002,40 @@ async function main() {
       })()`)) === true,
     await evaluate(cdp, `window.__wide`))
   await evaluate(cdp, `${wideBtn}.click()`)
-  check('再点一次终端回来', await waitFor(cdp, `${shown('.pane.active .term-box')}`, '终端回来'))
+  await check('再点一次终端回来', await waitFor(cdp, `${shown('.pane.active .term-box')}`, '终端回来'))
 
   const beforeA = llmSeen.length
   await sendMsg('根目录有什么')
-  check('只读的 ls 不问就直接跑了', await waitFor(cdp, `!!document.querySelector('.pane.active .agent-log .agent-step-body')`, 'ls 结果', 30000))
-  check('工具行写的是它真的要跑的那条',
+  await check('只读的 ls 不问就直接跑了', await waitFor(cdp, `!!document.querySelector('.pane.active .agent-log .agent-step-body')`, 'ls 结果', 30000))
+  await check('工具行写的是它真的要跑的那条',
     (await evaluate(cdp, `document.querySelector('.pane.active .agent-step-head').textContent`)) === 'ls /')
-  check('命令和它的输出在同一个折叠块里，不是两个各自漂着的块',
+  await check('命令和它的输出在同一个折叠块里，不是两个各自漂着的块',
     (await evaluate(cdp, `(() => {
       const s = document.querySelector('.pane.active .agent-step')
       return !!s.querySelector('.agent-step-body') && s.textContent.length > s.querySelector('.agent-step-head').textContent.length
     })()`)) === true)
-  check('只读工具一张确认卡都没弹', (await evaluate(cdp, `document.querySelectorAll('.pane.active .agent-ask').length`)) === 0)
-  check('模型拿到的是系统提示 + 用户那句话',
+  // Every tool step starts folded, even a one-line `ls` with a short answer:
+  // a turn of ten tools should read as ten lines, not ten paragraphs.
+  await check('工具调用默认就是折起来的',
+    (await evaluate(cdp, `document.querySelector('.pane.active .agent-step').classList.contains('folded')`)) === true)
+  await check('折起来时输出确实不在屏幕上',
+    (await evaluate(cdp, `getComputedStyle(document.querySelector('.pane.active .agent-step-body')).display`)) === 'none')
+  await check('折起来的标题只有一行，不会把命令折成一大段',
+    (await evaluate(cdp, `getComputedStyle(document.querySelector('.pane.active .agent-step-head')).whiteSpace`)) === 'nowrap')
+  await check('只读工具一张确认卡都没弹', (await evaluate(cdp, `document.querySelectorAll('.pane.active .agent-ask').length`)) === 0)
+  await check('模型拿到的是系统提示 + 用户那句话',
     llmSeen[beforeA]?.messages?.[0]?.role === 'system' &&
       llmSeen[beforeA].messages.some((m) => m.role === 'user' && m.content === '根目录有什么'),
     JSON.stringify(llmSeen[beforeA]?.messages?.[0]))
 
   await sendMsg('把根目录清空')
-  check('改动服务器的命令要确认，且这条被标成最高风险',
+  await check('改动服务器的命令要确认，且这条被标成最高风险',
     await waitFor(cdp, `!!document.querySelector('${askCard('.risk-critical')}')`, '高危确认卡', 30000))
-  check('卡片上就是模型要跑的那条命令',
+  await check('卡片上就是模型要跑的那条命令',
     (await evaluate(cdp, `document.querySelector('${askCard('.risk-critical')} .agent-ask-cmd').value`)) === 'rm -rf /')
   await answer('拒绝')
-  check('拒绝后卡片落定', await waitFor(cdp, `${LOG}.includes('已拒绝')`, '卡片收尾'))
-  check('拒绝这件事本身回给了模型，它没有换个写法硬来',
+  await check('拒绝后卡片落定', await waitFor(cdp, `${LOG}.includes('已拒绝')`, '卡片收尾'))
+  await check('拒绝这件事本身回给了模型，它没有换个写法硬来',
     await waitFor(cdp, `${LOG}.includes('好，那我不动它。')`, '模型接受拒绝', 30000) &&
       llmSeen.at(-1).messages.some((m) => m.role === 'tool' && String(m.content).startsWith('用户拒绝')))
 
@@ -1979,19 +2043,19 @@ async function main() {
   // `echo` only prints, so it is not destructive and goes straight through.
   // The whole point of this route: the command the model asked for is typed
   // into the terminal the user is looking at, not run out of sight.
-  check('只读的 exec 不问就直接跑了：输出和退出码都在结果里',
+  await check('只读的 exec 不问就直接跑了：输出和退出码都在结果里',
     await waitFor(cdp, `${LOG}.includes('ran:echo CLI_MARK') && ${LOG}.includes('exit=3') && ${LOG}.includes('warning line')`, '命令结果', 30000))
-  check('那条命令是打在左边终端里的',
+  await check('那条命令是打在左边终端里的',
     await waitFor(cdp, `document.querySelector('.pane.active .xterm-rows')?.textContent?.includes('echo CLI_MARK')`, '命令进终端', 30000))
-  check('既然不问，就真的不该有卡停在那里等人点',
+  await check('既然不问，就真的不该有卡停在那里等人点',
     (await evaluate(cdp, `document.querySelectorAll('.pane.active .agent-ask:not(.answered)').length`)) === 0)
 
   await sendMsg('来点长输出')
   await waitFor(cdp, `!!document.querySelector('${askCard(':not(.answered)')}')`, '长输出确认卡', 30000)
   await answer('执行')
-  check('长输出溢出成文件，模型拿着 handle 读回了中间那段',
+  await check('长输出溢出成文件，模型拿着 handle 读回了中间那段',
     await waitFor(cdp, `${LOG}.includes('已存为') && ${LOG}.includes('第 150-154 行')`, 'read_output 结果', 30000))
-  check('溢出后的对话还能继续', (await evaluate(cdp, `${LOG}.includes('中间那段看到了。')`)) === true)
+  await check('溢出后的对话还能继续', (await evaluate(cdp, `${LOG}.includes('中间那段看到了。')`)) === true)
 
   // The paperclip, driven through the preload API instead of a click — the
   // native picker cannot be driven from here, and this is the same call the
@@ -2006,33 +2070,33 @@ async function main() {
     cdp,
     `void window.api.agentSend(${JSON.stringify(attachSid)}, 'smoke', '看看我刚传上去的附件', [${JSON.stringify(attachLocal)}])`
   )
-  check('附件传上去了，面板说得也明白',
+  await check('附件传上去了，面板说得也明白',
     await waitFor(cdp, `${LOG}.includes('已上传到服务器：/tmp/attach-smoke.txt')`, '附件上传', 30000))
-  check('落地的就是那个文件的字节',
+  await check('落地的就是那个文件的字节',
     existsSync(join(sftpRoot, 'tmp', 'attach-smoke.txt')) &&
       readFileSync(join(sftpRoot, 'tmp', 'attach-smoke.txt'), 'utf8') === 'ATTACH_BODY_9\n')
-  check('远端路径跟着那句话一起给了模型，它才知道去哪读',
+  await check('远端路径跟着那句话一起给了模型，它才知道去哪读',
     llmSeen.at(-1)?.messages?.some(
       (m) => m.role === 'user' && String(m.content).includes('【附件已经传到服务器上了：/tmp/attach-smoke.txt】')
     ) === true)
-  check('模型顺着那个路径把附件读回来了',
+  await check('模型顺着那个路径把附件读回来了',
     await waitFor(cdp, `${LOG}.includes('ATTACH_BODY_9')`, '读到附件内容', 30000))
 
   // "Sent, and then nothing" — the report this test exists to prevent. The
   // endpoint stalls on purpose; the panel has to say so the whole time.
   await sendMsg('慢慢地想想')
-  check('请求还没回来时，面板上写着它在等',
+  await check('请求还没回来时，面板上写着它在等',
     (await evaluate(cdp, `document.querySelector('.pane.active .agent-msg.pending')?.textContent ?? ''`)).includes('正在请求'))
-  check('回复一到，那一行就换成了真内容',
+  await check('回复一到，那一行就换成了真内容',
     await waitFor(cdp, `${LOG}.includes('来了，慢是因为它在想。') && !document.querySelector('.pane.active .agent-msg.pending')`, '慢回复落地', 30000))
 
   await sendMsg('停下来试试')
-  check('等确认的时候那颗按钮是「停止」',
+  await check('等确认的时候那颗按钮是「停止」',
     await waitFor(cdp, `!!document.querySelector('${askCard(':not(.answered)')}') && document.querySelector('.pane.active .agent-go').classList.contains('stop')`, '等确认卡', 30000))
   await evaluate(cdp, `document.querySelector('.pane.active .agent-go').click()`)
-  check('同一颗按钮，跑着的时候按下去就是停',
+  await check('同一颗按钮，跑着的时候按下去就是停',
     await waitFor(cdp, `${LOG}.includes('已取消') && !document.querySelector('.pane.active .agent-go').classList.contains('stop')`, '停止生效', 30000))
-  check('中止和「用户拒绝」分开说，模型不会以为是自己被否了', (await evaluate(cdp, `${LOG}.includes('已停止')`)) === true)
+  await check('中止和「用户拒绝」分开说，模型不会以为是自己被否了', (await evaluate(cdp, `${LOG}.includes('已停止')`)) === true)
 
   /* ---------------- 换成 Anthropic：同一套循环，另一套协议 ---------------- */
 
@@ -2053,14 +2117,14 @@ async function main() {
     cdp,
     `[...document.querySelectorAll('#overlay .modal footer .btn')].find(b => b.textContent === '保存').click()`
   )
-  check('保存后设置自己关掉', await waitFor(cdp, `document.querySelector('#overlay').hidden`, '设置关闭'))
-  check('密钥留空保存不会把它抹掉', (await llmState()).hasKey === true, JSON.stringify(await llmState()))
+  await check('保存后设置自己关掉', await waitFor(cdp, `document.querySelector('#overlay').hidden`, '设置关闭'))
+  await check('密钥留空保存不会把它抹掉', (await llmState()).hasKey === true, JSON.stringify(await llmState()))
 
   await sendMsg('根目录有什么')
   // The reset lands with the first message to the new endpoint — that is the
   // moment the transcript would otherwise be sent somewhere it cannot be read.
-  check('换了接口，旧对话不再硬塞给新接口', await waitFor(cdp, `${LOG}.includes('从这里重新开始')`, '接口切换提示'))
-  check('Anthropic 那边也跑起来了：一轮里两个只读调用都执行了',
+  await check('换了接口，旧对话不再硬塞给新接口', await waitFor(cdp, `${LOG}.includes('从这里重新开始')`, '接口切换提示'))
+  await check('Anthropic 那边也跑起来了：一轮里两个只读调用都执行了',
     await waitFor(
       cdp,
       `(() => {
@@ -2069,20 +2133,20 @@ async function main() {
        })()`,
       '两个工具都跑了',
       30000))
-  check('Anthropic 的 system 是顶层参数，没被忘掉',
+  await check('Anthropic 的 system 是顶层参数，没被忘掉',
     typeof claudeSeen[0]?.system === 'string' && claudeSeen[0].system.includes('规矩'))
-  check('换接口之后的历史是干净的（只有这一句话）',
+  await check('换接口之后的历史是干净的（只有这一句话）',
     claudeSeen[0]?.messages?.length === 1 && claudeSeen[0].messages[0].role === 'user')
-  check('并行调用的结果并回一条 user 消息里，不是拆成两条',
+  await check('并行调用的结果并回一条 user 消息里，不是拆成两条',
     claudeSeen[1]?.messages?.at(-1)?.role === 'user' &&
       Array.isArray(claudeSeen[1].messages.at(-1).content) &&
       claudeSeen[1].messages.at(-1).content.length === 2 &&
       claudeSeen[1].messages.at(-1).content.every((b) => b.type === 'tool_result'),
     JSON.stringify(claudeSeen[1]?.messages?.at(-1))?.slice(0, 200))
-  check('上一轮的 tool_use 原样回传（改动过的 thinking/tool 块会 400）',
+  await check('上一轮的 tool_use 原样回传（改动过的 thinking/tool 块会 400）',
     (claudeSeen[1]?.messages?.at(-2)?.content ?? []).some((b) => b.type === 'tool_use' && b.id === 'toolu_smoke_1') &&
       (claudeSeen[1]?.messages?.at(-2)?.content ?? []).some((b) => b.type === 'tool_use' && b.id === 'toolu_smoke_2'))
-  check('Anthropic 这一轮也收尾了', await waitFor(cdp, `${LOG}.includes('这台机器看过了。')`, 'Anthropic 回复', 30000))
+  await check('Anthropic 这一轮也收尾了', await waitFor(cdp, `${LOG}.includes('这台机器看过了。')`, 'Anthropic 回复', 30000))
 
   // A model name the endpoint does not have. The request fails in under a
   // second, and the panel has to show why instead of leaving the user staring
@@ -2093,7 +2157,7 @@ async function main() {
   await evaluate(cdp, save)
   await waitFor(cdp, `document.querySelector('#overlay').hidden`, '设置关闭')
   await sendMsg('随便问问')
-  check('模型名不对时错在面板上，不是一片安静',
+  await check('模型名不对时错在面板上，不是一片安静',
     await waitFor(cdp, `${LOG}.includes('模型名或接口地址不对（404）')`, '404 显示出来', 30000))
 
   // The same silence from the other direction: the endpoint answers 200 with a
@@ -2115,8 +2179,22 @@ async function main() {
   await evaluate(cdp, save)
   await waitFor(cdp, `document.querySelector('#overlay').hidden`, '设置关闭')
   await sendMsg('你好')
-  check('接口回了空内容也说出来，而不是一声不吭',
-    await waitFor(cdp, `${LOG}.includes('接口回了空内容')`, '空回复提示', 30000),
+  // Not "空内容": the body is right there, and quoting it is the whole fix —
+  // "no channel for this model" is what the user needs to read.
+  await check('接口回了空内容也说出来，而不是一声不吭',
+    await waitFor(cdp, `${LOG}.includes('没有吐出任何流式内容') && ${LOG}.includes('网关首页')`, '空回复提示', 30000),
+    await evaluate(cdp, LOG))
+
+  // And the JSON-error variant: the panel must not tell the user to check /v1
+  // when the gateway said exactly what was wrong.
+  await evaluate(cdp, `document.querySelector('#btn-settings').click()`)
+  await waitFor(cdp, `!!document.querySelector('#overlay .modal input[type=password]')`, '开设置改模型')
+  await evaluate(cdp, `(() => { ${modelBox}.value = 'no-channel' })()`)
+  await evaluate(cdp, save)
+  await waitFor(cdp, `document.querySelector('#overlay').hidden`, '设置关闭')
+  await sendMsg('你好')
+  await check('网关自己说了原因时，把那句原文转给用户',
+    await waitFor(cdp, `${LOG}.includes('无可用渠道')`, '转发网关原因', 30000),
     await evaluate(cdp, LOG))
 
   /* ---------------- ai panel in its own window ---------------- */
@@ -2125,22 +2203,22 @@ async function main() {
   await sleep(1500)
   const pages = async () => (await (await fetch(`http://127.0.0.1:${DEBUG_PORT}/json/list`)).json())
   const aiTarget = (await pages()).find((t) => t.type === 'page' && t.url.includes('agent='))
-  check('AI 面板能弹成独立窗口', !!aiTarget)
+  await check('AI 面板能弹成独立窗口', !!aiTarget)
   if (aiTarget) {
     const cdpAi = await connect(aiTarget.webSocketDebuggerUrl)
-    check(
+    await check(
       '独立窗口里只有 AI 面板',
       await evaluate(cdpAi, `!!document.querySelector('.agent.agent-standalone') && !document.querySelector('#body').offsetParent`)
     )
-    check(
+    await check(
       '已经聊过的内容被带进独立窗口',
       await waitFor(cdpAi, `document.querySelectorAll('.agent-msg').length > 0`, '回放对话', 15000)
     )
-    check(
+    await check(
       '回复以卡片和渲染后的 Markdown 呈现',
       await evaluate(cdpAi, `!!document.querySelector('.agent-msg.assistant.md p')`)
     )
-    check(
+    await check(
       '弹出去之后原来那个侧面板自己收起来（对话只有一个输入框）',
       await waitFor(cdp, `document.querySelector('.pane.active .agent').style.display === 'none'`, '侧面板收起', 15000)
     )
@@ -2148,17 +2226,54 @@ async function main() {
     // back here — that is the whole point of handing it over.
     await evaluate(cdpAi, `(() => {
       const box = document.querySelector('.agent-input')
-      box.value = '跑一下 echo 试试'
+      box.value = '来点长输出'
       document.querySelector('.agent-go').click()
     })()`)
-    check('在独立窗口里发的话，回复也落在独立窗口',
+    await check('在独立窗口里发的话，回复也落在独立窗口',
       await waitFor(cdpAi, `document.querySelector('.agent-log').textContent.includes('跑完了')`, '独立窗口交互', 30000))
-    check('主窗口的侧面板没有跟着再长出一条新消息',
+    // The standalone window has no terminal row to clip it: the log itself has
+    // to stay the height of the window and scroll. Before the fix it grew to
+    // 2300px and `body { overflow: hidden }` cut the rest off — no auto-scroll,
+    // no wheel, the newest output off screen.
+    {
+      const scroll = async () =>
+        JSON.parse(
+          await evaluate(cdpAi, `(() => {
+            const log = document.querySelector('.agent-log')
+            return JSON.stringify({ h: log.clientHeight, sh: log.scrollHeight, top: log.scrollTop, win: innerHeight })
+          })()`)
+        )
+      let state = await scroll()
+      // One long answer may not fill the window; repeat until it does.
+      for (let i = 0; i < 4 && state.sh <= state.h; i++) {
+        await evaluate(cdpAi, `(() => {
+          const box = document.querySelector('.agent-input')
+          box.value = '来点长输出'
+          document.querySelector('.agent-go').click()
+        })()`)
+        await sleep(2500)
+        state = await scroll()
+      }
+      await check('独立窗口里日志不会把面板撑出窗口', state.h <= state.win,
+        `log=${state.h} window=${state.win} content=${state.sh}`)
+      await check('内容比窗口高时，日志自己可以滚', state.sh > state.h, `log=${state.h} content=${state.sh}`)
+      const atBottom = state.sh - state.top - state.h < 40
+      await check('新消息来了自动滚到底', atBottom, `top=${state.top} content=${state.sh} log=${state.h}`)
+      const r = JSON.parse(
+        await evaluate(cdpAi, `(() => { const b = document.querySelector('.agent-log').getBoundingClientRect();
+          return JSON.stringify({ x: Math.round(b.left + b.width / 2), y: Math.round(b.top + b.height / 2) }) })()`)
+      )
+      await cdpAi.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: r.x, y: r.y, deltaX: 0, deltaY: -400 })
+      await sleep(400)
+      const after = await scroll()
+      await check('鼠标滚轮能把日志往上翻', after.top < state.top, `${state.top} → ${after.top}`)
+    }
+    await check('主窗口的侧面板没有跟着再长出一条新消息',
       (await evaluate(cdp, `document.querySelectorAll('.pane.active .agent-log .agent-msg.user').length`)) === 0 ||
         (await evaluate(cdp, `document.querySelector('.pane.active .agent').style.display === 'none'`)))
     await evaluate(cdpAi, `document.querySelector('.panel-x').click()`)
     await sleep(800)
-    check('独立窗口的 X 关掉窗口', !(await pages()).some((t) => t.type === 'page' && t.url.includes('agent=')))
+    await check('独立窗口的 X 关掉窗口', !(await pages()).some((t) => t.type === 'page' && t.url.includes('agent=')))
     cdpAi.close()
   }
 
@@ -2169,40 +2284,112 @@ async function main() {
   const history = JSON.parse(
     await evaluate(cdp, `window.api.agentHistory('smoke').then(l => JSON.stringify(l))`)
   )
-  check('聊过的话存进了这台机器的历史', history.length >= 1, `got ${history.length}`)
-  check('标题是这段对话里的第一句话', typeof history[0]?.title === 'string' && history[0].title.length > 0, JSON.stringify(history[0]))
-  check('别的机器看不到这段对话',
+  await check('聊过的话存进了这台机器的历史', history.length >= 1, `got ${history.length}`)
+  await check('标题是这段对话里的第一句话', typeof history[0]?.title === 'string' && history[0].title.length > 0, JSON.stringify(history[0]))
+  await check('别的机器看不到这段对话',
     JSON.parse(await evaluate(cdp, `window.api.agentHistory('smoke-pw').then(l => JSON.stringify(l))`)).length === 0)
 
-  await evaluate(cdp, `document.querySelector('.pane.active [title="查看并导出这台机器的历史对话"]').click()`)
-  check('面板上的「历史」列出存下来的对话',
-    await waitFor(cdp, `document.querySelectorAll('#overlay .hist-item').length >= 1`, '历史列表'))
-  await evaluate(cdp, `document.querySelector('#overlay .hist-item').click()`)
-  check('打开一条历史能看到当时的提问',
-    await waitFor(cdp, `!!document.querySelector('#overlay .history-view .agent-msg.user')`, '历史正文'))
-  check('历史里的回复也是渲染过的 Markdown',
-    await evaluate(cdp, `!!document.querySelector('#overlay .history-view .agent-msg.assistant.md')`))
-  check('历史对话里能接着问', await evaluate(cdp,
-    `[...document.querySelectorAll('#overlay .modal footer .btn')].some(b => b.textContent === '继续这个对话')`))
-  await evaluate(cdp, `[...document.querySelectorAll('#overlay .modal footer .btn')].find(b => b.textContent === '继续这个对话').click()`)
-  check('继续之后的历史真的回到了面板里（面板打开、问题都在、确认卡不能点）',
+  // The header's ☰ opens the drawer; picking a row resumes in place, which is
+  // the whole point of a history list next to the conversation.
+  await evaluate(cdp, `document.querySelector('.pane.active .agent-head [title="历史对话（Ctrl+Shift+A）"]').click()`)
+  await check('面板上的 ☰ 滑出历史列表',
+    await waitFor(cdp, `document.querySelectorAll('.pane.active .agent-drawer .agent-convo').length >= 1`, '历史抽屉'))
+  await check('抽屉上写着这是哪台机器的历史',
+    (await evaluate(cdp, `document.querySelector('.pane.active .agent-drawer-scope').textContent`))?.includes('local-smoke'),
+    await evaluate(cdp, `document.querySelector('.pane.active .agent-drawer-scope').textContent`))
+  // The load-bearing one: every row in the drawer is a conversation the IPC
+  // returns for THIS connection, and nothing from another one. Compared as
+  // sets, so a leaked row fails.
+  {
+    const own = JSON.parse(
+      await evaluate(cdp, `window.api.agentHistory('smoke').then(l => JSON.stringify(l.map(x => x.title)))`)
+    )
+    const other = JSON.parse(
+      await evaluate(cdp, `window.api.agentHistory('smoke-pw').then(l => JSON.stringify(l.map(x => x.title)))`)
+    )
+    const shown = JSON.parse(
+      await evaluate(
+        cdp,
+        `JSON.stringify([...document.querySelectorAll('.pane.active .agent-drawer .agent-convo-title')].map(t => t.textContent))`
+      )
+    )
+    await check('抽屉里每一条都属于这台机器', shown.length > 0 && shown.every((t) => own.includes(t)),
+      `shown=${shown.join('|')} own=${own.join('|')}`)
+    await check('别的机器的对话一条也没漏进来', !shown.some((t) => other.includes(t)), `other=${other.join('|')}`)
+  }
+  await check('抽屉里搜得到这轮对话',
+    await waitFor(cdp, `(() => {
+      const box = document.querySelector('.pane.active .agent-drawer-search')
+      box.value = '磁盘'
+      box.dispatchEvent(new Event('input', { bubbles: true }))
+      return document.querySelectorAll('.pane.active .agent-drawer .agent-convo').length >= 1
+    })()`, '搜索历史'))
+  await evaluate(cdp, `(() => {
+    const box = document.querySelector('.pane.active .agent-drawer-search')
+    box.value = ''
+    box.dispatchEvent(new Event('input', { bubbles: true }))
+  })()`)
+  await sleep(300)
+  await evaluate(cdp, `document.querySelector('.pane.active .agent-drawer .agent-convo').click()`)
+  await check('点一条历史就在面板里接着聊（抽屉收起、问题都在、确认卡不能点）',
     await waitFor(cdp, `(() => {
       const log = document.querySelector('.pane.active .agent-log')
       const panel = document.querySelector('.pane.active .agent')
-      return document.querySelector('#overlay').hidden && panel.style.display !== 'none' &&
+      return panel.querySelector('.agent-drawer').hidden && panel.style.display !== 'none' &&
         log.querySelectorAll('.agent-msg.user').length > 0 &&
         [...log.querySelectorAll('.agent-ask')].every(c => !c.querySelector('.agent-ask-btns'))
     })()`, '继续历史对话'))
-  await evaluate(cdp, `document.querySelector('.pane.active [title="查看并导出这台机器的历史对话"]').click()`)
-  check('返回回到列表', await waitFor(cdp, `document.querySelectorAll('#overlay .hist-item').length >= 1`, '回到列表'))
-  await evaluate(cdp, `document.querySelector('#overlay').dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))`)
-  await waitFor(cdp, `document.querySelector('#overlay').hidden`, '历史面板关闭')
+  await check('继续之后标题换成那条对话的第一句话',
+    ((await evaluate(cdp, `document.querySelector('.pane.active .agent-title').textContent`)) ?? '').length > 0)
+
+  await evaluate(cdp, `document.querySelector('.pane.active .agent-head [title="历史对话（Ctrl+Shift+A）"]').click()`)
+  await waitFor(cdp, `!!document.querySelector('.pane.active .agent-drawer .agent-convo')`, '再开抽屉')
+  await evaluate(cdp, `document.querySelector('.pane.active .agent-veil').click()`)
+  await check('点抽屉外的地方收起', await waitFor(cdp, `document.querySelector('.pane.active .agent-drawer').hidden`, '抽屉收起'))
+
+  /* ---------------- 切标签页，AI 面板跟着切对话 ---------------- */
+
+  // One panel per window, one conversation per connection: switching tabs must
+  // NOT close the panel — it swaps the transcript in place. The user's report
+  // was exactly the opposite behaviour ("面板被关闭了，需要手动打开").
+  if ((await evaluate(cdp, `document.querySelectorAll('#tabs .tab').length`)) >= 2) {
+    const panelState = () =>
+      evaluate(cdp, `(() => {
+        const a = document.querySelector('.pane.active .agent')
+        return JSON.stringify({
+          display: a ? getComputedStyle(a).display : 'missing',
+          title: a ? a.querySelector('.agent-title')?.textContent : '',
+          msgs: a ? a.querySelectorAll('.agent-log .agent-msg').length : -1,
+          toolbarOn: !!document.querySelector('.pane.active [data-act="agent"].on')
+        })
+      })()`)
+    const activeIndex = await evaluate(
+      cdp,
+      `[...document.querySelectorAll('#tabs .tab')].findIndex(t => t.classList.contains('active'))`
+    )
+    const otherIndex = activeIndex === 0 ? 1 : 0
+    await evaluate(cdp, `document.querySelectorAll('#tabs .tab')[${otherIndex}].click()`)
+    await sleep(600)
+    const other = JSON.parse(await panelState())
+    await check('切到另一个标签，AI 面板仍然开着（不用再手动点一次）', other.display === 'flex', JSON.stringify(other))
+    await check('新标签的工具栏上 AI 也是按下的', other.toolbarOn === true, JSON.stringify(other))
+    await check('切走的那一页，它的面板不在屏幕上',
+      await evaluate(cdp, `[...document.querySelectorAll('.pane:not(.active) .agent')].every(a => getComputedStyle(a).display === 'none')`))
+    await evaluate(cdp, `document.querySelectorAll('#tabs .tab')[${activeIndex}].click()`)
+    await sleep(600)
+    const back = JSON.parse(await panelState())
+    await check('切回来时对话还在，也没有被重开', back.display === 'flex' && back.msgs > 0, JSON.stringify(back))
+    await check('两个标签的对话标题不同（面板换的是内容，不是整个关掉',
+      other.title !== back.title || other.msgs !== back.msgs,
+      `other=${other.title}/${other.msgs} back=${back.title}/${back.msgs}`)
+  }
+
 
   /* ---------------- popped-out tab ---------------- */
 
-  check('已连接的标签打着绿点', await evaluate(cdp, `!!document.querySelector('#tabs .tab.live .tdot')`))
+  await check('已连接的标签打着绿点', await evaluate(cdp, `!!document.querySelector('#tabs .tab.live .tdot')`))
   const tabCount = await evaluate(cdp, `document.querySelectorAll('#tabs .tab').length`)
-  check('至少有一个标签可以弹出', tabCount > 0, `tabs=${tabCount}`)
+  await check('至少有一个标签可以弹出', tabCount > 0, `tabs=${tabCount}`)
   await evaluate(
     cdp,
     `(() => {
@@ -2211,7 +2398,7 @@ async function main() {
        return true
      })()`
   )
-  check(
+  await check(
     '标签右键菜单列出了会话操作',
     await evaluate(
       cdp,
@@ -2230,15 +2417,15 @@ async function main() {
   const popTarget = (
     await (await fetch(`http://127.0.0.1:${DEBUG_PORT}/json/list`)).json()
   ).find((t) => t.type === 'page' && t.url.includes('attach='))
-  check('独立窗口开了出来', !!popTarget)
+  await check('独立窗口开了出来', !!popTarget)
   if (popTarget) {
     const cdpPop = await connect(popTarget.webSocketDebuggerUrl)
-    check(
+    await check(
       '独立窗口里的标签也是绿的',
       await evaluate(cdpPop, `!!document.querySelector('#tabs .tab.live .tdot')`)
     )
-    check('独立窗口里有终端', await evaluate(cdpPop, `!!document.querySelector('.term-box .xterm')`))
-    check(
+    await check('独立窗口里有终端', await evaluate(cdpPop, `!!document.querySelector('.term-box .xterm')`))
+    await check(
       '原来那个窗口里的标签移走了',
       await waitFor(
         cdp,
@@ -2263,7 +2450,7 @@ async function main() {
        })()`
     )
     await evaluate(cdp, `[...document.querySelectorAll('#menu div')].find(d => d.textContent === '断开').click()`)
-    check(
+    await check(
       '断开之后标签还在，点变红',
       await waitFor(cdp, `!!document.querySelector('#tabs .tab.failed .tdot')`, '断开后的红点')
     )
@@ -2283,7 +2470,7 @@ async function main() {
     cdp,
     `[...document.querySelectorAll('#menu div')].find(d => d.textContent === '远程桌面 (RDP)…').click()`
   )
-  check(
+  await check(
     '连接菜单能打开远程桌面对话框',
     await waitFor(
       cdp,
@@ -2303,7 +2490,7 @@ async function main() {
       await (await fetch(`http://127.0.0.1:${DEBUG_PORT}/json/list`)).json()
     ).find((t) => t.type === 'page' && t.url.includes('desktop='))
   }
-  check('内嵌远程桌面有自己的窗口', !!deskTarget)
+  await check('内嵌远程桌面有自己的窗口', !!deskTarget)
   if (deskTarget) {
     const deskConsole = []
     const cdpDesk = await connect(deskTarget.webSocketDebuggerUrl, (msg) => {
@@ -2315,14 +2502,14 @@ async function main() {
       }
     })
     await cdpDesk.send('Runtime.enable')
-    check(
+    await check(
       '窗口里是桌面画布，不是普通标签页',
       await evaluate(
         cdpDesk,
         `document.body.classList.contains('desktop-popout') && !!document.querySelector('canvas.desktop-canvas')`
       )
     )
-    check(
+    await check(
       '没有 RDP 服务时显示可读的错误，而不是空白画布',
       await waitFor(
         cdpDesk,
@@ -2332,17 +2519,17 @@ async function main() {
       ),
       await evaluate(cdpDesk, `document.querySelector('.desktop-error').textContent`)
     )
-    check(
+    await check(
       '状态条说连接失败',
       await evaluate(cdpDesk, `document.querySelector('.desktop-status').textContent === '连接失败'`)
     )
     const appOut = log.map(([, d]) => d).join('')
-    check(
+    await check(
       '主进程记下了转发失败的原因和目标端口',
       /RDCleanPath failed: 转发到远端 127\.0\.0\.1:3389/.test(appOut),
       appOut.split('\n').filter((l) => l.includes('[rdp]')).slice(-5).join(' | ')
     )
-    check(
+    await check(
       'WASM 组件在 CSP 下加载，没有安全策略报错',
       !deskConsole.some((l) => /Content Security Policy|Refused to/.test(l)),
       deskConsole.join(' | ')
@@ -2356,7 +2543,7 @@ async function main() {
         (t) => t.type === 'page' && t.url.includes('desktop=')
       )
     }
-    check('关掉窗口就结束了这条内嵌会话', gone)
+    await check('关掉窗口就结束了这条内嵌会话', gone)
   }
 
   /* ---------------- panel dividers and the updater ---------------- */
@@ -2373,8 +2560,8 @@ async function main() {
     window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }))
   })()`)
   const widthAfter = await evaluate(cdp, `Math.round(document.querySelector('.pane.active .monitor').getBoundingClientRect().width)`)
-  check('拖监控面板左侧的分隔线能改宽度', widthAfter > widthBefore + 80, `${widthBefore} → ${widthAfter}`)
-  check(
+  await check('拖监控面板左侧的分隔线能改宽度', widthAfter > widthBefore + 80, `${widthBefore} → ${widthAfter}`)
+  await check(
     '文件面板也有同一根分隔线',
     await evaluate(cdp, `!!document.querySelector('.pane.active .files .panel-grip')`)
   )
@@ -2382,13 +2569,13 @@ async function main() {
 
   await evaluate(cdp, `document.querySelector('#btn-settings').click()`)
   await waitFor(cdp, `!!document.querySelector('#overlay .modal h2')?.textContent?.includes('设置')`, '开设置找更新')
-  check(
+  await check(
     '设置里有检查更新，并显示当前版本',
     await waitFor(cdp, `[...document.querySelectorAll('#overlay .modal .mon-sub')].some(s => /当前版本 \\d/.test(s.textContent))`, '版本号'),
     await evaluate(cdp, `document.querySelector('#overlay .modal').textContent`)
   )
   await evaluate(cdp, `[...document.querySelectorAll('#overlay .modal button')].find(b => b.textContent === '检查更新').click()`)
-  check(
+  await check(
     '检查更新会去问 GitHub，并把结果（新版/最新/失败）说出来',
     await waitFor(
       cdp,
@@ -2417,13 +2604,13 @@ async function main() {
     // The process has to survive it: the tray is the point, and so is the CLI,
     // which is left with no main process if the app quits with the window.
     const afterClose = await cli('conns')
-    check(
+    await check(
       '点 X 之后进程还在，CLI 照样连得上它',
       afterClose.json?.ok === true && afterClose.status === 0,
       afterClose.raw.trim()
     )
     const visible = win32(`[SmokeWin]::IsWindowVisible([IntPtr]${hwnd})`)
-    check(
+    await check(
       '点 X 只是把窗口收进托盘',
       sent === 'True' && visible === 'False',
       `PostMessage=${sent} IsWindowVisible=${visible} hwnd=${hwnd}`

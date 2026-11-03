@@ -484,9 +484,13 @@ const RANK: Record<Risk, number> = { safe: 0, risky: 1, critical: 2 }
 /** `where` is the endpoint that was being talked to. Connection failures from
  *  the SDKs arrive as a bare "Connection error." with no host in them, which is
  *  the one case where the user cannot tell what to go look at. */
-function describe(err: unknown, where = ''): string {
+export function describe(err: unknown, where = ''): string {
   const e = err as { status?: number; message?: string; name?: string; error?: { message?: string } }
   const msg = e?.error?.message ?? e?.message ?? String(err)
+  // A stream that came back empty already explains itself in full: which status,
+  // what the body was, and what usually causes it. Prefixing it with "服务商
+  // 出错（200）" would bury the one useful line under a status that says "fine".
+  if (/没有吐出任何流式内容/.test(msg)) return msg
   if (!e?.status && /connect|timeout|fetch failed|socket/i.test(`${e?.name} ${msg}`)) {
     return `连不上 ${where || '接口地址'}：${msg} —— 检查地址、端口和网络。`
   }
@@ -706,8 +710,14 @@ export class AgentRunner {
     // The saved copy and the live windows are written from the same event, so
     // what the history list shows is what was on screen. The messages go along
     // with them: they are what makes the saved conversation resumable.
+    const before = talk.conversationId
     talk.conversationId = history.append(talk.conversationId, talk.connectionId, event, talk.messages, talk.endpoint)
     this.emit({ type: 'agent', sessionId: talk.sessionId, event })
+    // A new thread's id, announced once: the panel names itself and the drawer
+    // marks the row. Repeating it every event would be one message per token.
+    if (talk.conversationId !== before) {
+      this.emit({ type: 'agent-convo', sessionId: talk.sessionId, conversationId: talk.conversationId ?? '' })
+    }
   }
 
   /**
@@ -789,16 +799,21 @@ export class AgentRunner {
           if (talk.compact || talk.messages.length >= MAX_MESSAGES) {
             await this.compact(talk, provider, controller.signal)
           }
-          // An empty turn is not a quiet model, it is a wrong address: the
-          // commonest cause is a gateway URL missing `/v1`, which answers 200
-          // with a web page that streams as zero chunks. Silence here is what
-          // makes that look like a dead button.
+          // An empty turn with nothing at all in it is not a quiet model. The
+          // address is only one of several causes, and guessing at it sent
+          // people to recheck a URL that was fine: this model had thought about
+          // the question for 800 characters and then produced neither text nor
+          // a tool call, which is the model, not the gateway. Say which one it
+          // is instead of naming the first theory.
           if (!turn.text.trim()) {
             this.push(talk, {
               kind: 'error',
-              message:
-                `接口回了空内容 —— 没有文字也没有工具调用。多半是地址不对：` +
-                `OpenAI 兼容网关通常要带 /v1。现在用的是 ${llm.baseUrl || '官方默认地址'} / ${llm.model}。`
+              message: turn.thought
+                ? `模型只思考没作答 —— 它想了内容，但既没有给文字也没有调工具（可能是该模型/网关对工具调用支持不完整）。` +
+                  `模型：${llm.model}。换个模型，或者把这次的问题说得更具体一点再试。`
+                : `接口回了空内容 —— 没有文字、没有工具调用，也没有思考内容。` +
+                  `地址不对是原因之一（OpenAI 兼容网关通常要带 /v1），也可能是网关限流或额度用尽。` +
+                  `现在用的是 ${llm.baseUrl || '官方默认地址'} / ${llm.model}。`
             })
           }
           return

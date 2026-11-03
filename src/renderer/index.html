@@ -36,6 +36,17 @@
           <button id="btn-new-folder" class="icon-btn" title="新建文件夹">🗀</button>
           <button id="btn-new-conn" class="icon-btn" title="新建连接">＋</button>
         </div>
+        <div class="side-search">
+          <input
+            id="tree-search"
+            type="search"
+            placeholder="搜索名称、IP、用户名"
+            autocomplete="off"
+            spellcheck="false"
+            title="按名称、主机/IP、用户名或端口过滤连接（Ctrl+F）"
+          />
+          <button id="tree-search-clear" class="icon-btn" title="清空搜索" hidden>×</button>
+        </div>
         <div id="tree" class="scroll"></div>
       </aside>
       <div id="resizer"></div>

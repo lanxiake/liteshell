@@ -62,6 +62,7 @@ const api: Api = {
   agentApprove: (askId, allowed, command) => ipcRenderer.invoke('agent:approve', askId, allowed, command),
   agentAbort: (sessionId) => ipcRenderer.invoke('agent:abort', sessionId),
   listModels: (cfg) => ipcRenderer.invoke('llm:models', cfg),
+  testModel: (cfg) => ipcRenderer.invoke('llm:test', cfg),
   agentReset: (sessionId) => ipcRenderer.invoke('agent:reset', sessionId),
   agentResume: (sessionId, connectionId, id) => ipcRenderer.invoke('agent:resume', sessionId, connectionId, id),
   agentHistory: (connectionId) => ipcRenderer.invoke('agent:history', connectionId),

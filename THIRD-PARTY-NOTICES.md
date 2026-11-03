@@ -28,6 +28,15 @@ LiteShell 自身以 MIT 许可发布（见 [LICENSE](LICENSE)）。下面是随�
 - 许可：MIT，Copyright (c) 2011 Einar Otto Stangvik、2013 Arnout Kazemier and contributors、
   2016 Luigi Pinca and contributors
 
+## AI 助手的厂商预设
+
+### models.dev
+
+- 用途：`src/shared/presets.ts` 里的厂商地址、模型名与上下文窗口，是该项目数据的摘录快照
+- 来源：<https://github.com/anomalyco/models.dev>（<https://models.dev>）
+- 许可：MIT
+- 分发形式：手工摘录为 TypeScript 数据表，未在运行时联网读取；模型名过时由「拉取模型」现场刷新
+
 ## MIT 许可全文
 
 以下许可适用于上面列出的第三方代码。
@@ -40,6 +49,7 @@ Copyright (c) 2026 meanaverage
 Copyright (c) 2011 Einar Otto Stangvik
 Copyright (c) 2013 Arnout Kazemier and contributors
 Copyright (c) 2016 Luigi Pinca and contributors
+Copyright (c) models.dev contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

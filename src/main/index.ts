@@ -25,10 +25,10 @@ import type {
 import { SshManager } from './ssh'
 import { DesktopManager } from './desktop'
 import { CliServer } from './cli-server'
-import { AgentRunner, clearSpill } from './agent'
+import { AgentRunner, clearSpill, describe } from './agent'
 import * as history from './agenthistory'
 import { transcriptMarkdown } from './transcript'
-import { listModels } from './agent-providers'
+import { listModels, testModel } from './agent-providers'
 import { importFinalshell } from './finalshell'
 import { setupPasswordless } from './passwordless'
 import { localInterfaces } from './localnet'
@@ -145,6 +145,13 @@ function emit(ev: SessionEvent): void {  // A conversation dies with its tab. It
       if (log.length > 500) log.shift()
       agentLog.set(ev.sessionId, log)
     }
+    for (const wc of agentWindows.get(ev.sessionId) ?? []) {
+      if (!wc.isDestroyed()) wc.send('session:event', ev)
+    }
+  }
+  // The panel in the main window hears it through the same broadcast as the
+  // transcript; a popped-out window keeps its own listener.
+  if (ev.type === 'agent-convo') {
     for (const wc of agentWindows.get(ev.sessionId) ?? []) {
       if (!wc.isDestroyed()) wc.send('session:event', ev)
     }
@@ -523,6 +530,27 @@ function registerIpc(): void {
     'llm:models',
     (_e, cfg: { provider: Settings['llm']['provider']; baseUrl: string; apiKey?: string }) =>
       listModels({ ...cfg, apiKey: cfg.apiKey || llmSettings().apiKey })
+  )
+  // A real round trip through the same adapter the panel uses, so the reply is
+  // what the panel would actually see — including the empty-stream diagnosis.
+  ipcMain.handle(
+    'llm:test',
+    async (
+      _e,
+      cfg: { provider: Settings['llm']['provider']; baseUrl: string; model: string; apiKey?: string; contextK?: number }
+    ) => {
+      try {
+        return await testModel({
+          provider: cfg.provider,
+          baseUrl: cfg.baseUrl,
+          model: cfg.model,
+          apiKey: cfg.apiKey || llmSettings().apiKey,
+          contextK: cfg.contextK ?? 128
+        })
+      } catch (err) {
+        throw new Error(describe(err, cfg.baseUrl || cfg.model))
+      }
+    }
   )
   ipcMain.handle('agent:reset', (_e, sessionId: string) => {
     agentLog.delete(sessionId)
