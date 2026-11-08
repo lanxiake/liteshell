@@ -4,9 +4,10 @@ import { createServer, type Server, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { app } from 'electron'
-import type { Connection, SessionEvent, SessionStatus } from '../shared/types'
+import type { AgentEvent, Connection, SessionEvent, SessionStatus } from '../shared/types'
 import { store } from './store'
 import type { SshManager } from './ssh'
+import { describeOp, summarize } from './cli-trace'
 
 /**
  * Lets an agent drive this app instead of opening its own SSH client.
@@ -65,6 +66,13 @@ export type Req = {
    *  one — and so the agent's commands share the connection the user is paying
    *  for rather than opening another handshake. */
   sessionId?: string
+  /** The user's own words, from the AI client that is driving the CLI. Shown in
+   *  the AI panel as their turn, so the transcript reads like a conversation
+   *  instead of a list of commands that appeared from nowhere. */
+  intent?: string
+  /** The client's one-line explanation of what it is about to do. Optional:
+   *  without it the panel falls back to a generic line for the operation. */
+  say?: string
 }
 
 function clampTimeout(v: number | undefined): number {
@@ -110,10 +118,17 @@ export class CliServer {
    *  refusal instead of a generic handshake failure. */
   private refused = new Set<string>()
   private waiters = new Map<string, (s: SessionStatus) => void>()
+  /** Session -> the last intent shown in its panel. A CLI client is a fresh
+   *  process per command, so the panel cannot see a turn boundary; it shows the
+   *  user's words again only when the intent changed. */
+  private lastIntent = new Map<string, string>()
 
   constructor(
     private manager: SshManager,
-    private openTab: (connectionId: string, sessionId: string) => void
+    private openTab: (connectionId: string, sessionId: string) => void,
+    /** Told to put a turn in the AI panel. Absent in tests, and in any build
+     *  without the AI panel — tracing is a view, never a precondition. */
+    private trace: (sessionId: string, event: AgentEvent) => void = () => undefined
   ) {}
 
   /** Fed the same events the renderer sees, so the CLI can tell a live session from
@@ -122,6 +137,9 @@ export class CliServer {
     if (ev.type === 'status') {
       this.status.set(ev.sessionId, ev.status)
       if (ev.error) this.lastError.set(ev.sessionId, ev.error)
+      // A closed session's transcript does not outlive it: otherwise the next
+      // turn under the same wording would be silent (see `lastIntent`).
+      if (ev.status === 'closed' || ev.status === 'error') this.lastIntent.delete(ev.sessionId)
       if (ev.status === 'ready' || ev.status === 'error' || ev.status === 'closed') {
         this.waiters.get(ev.sessionId)?.(ev.status)
         this.waiters.delete(ev.sessionId)
@@ -200,7 +218,63 @@ export class CliServer {
     if (req.token !== this.token) {
       return fail('bad_token', 'auth', '令牌不匹配', '令牌是 LiteShell 启动时写入的；如果刚重启过它，重试一次即可')
     }
-    return this.dispatch(req)
+    const trace = await this.beginTrace(req)
+    try {
+      const res = await this.dispatch(req)
+      trace?.finish(res)
+      return res
+    } catch (err) {
+      trace?.finish(fail('internal_error', 'cli', (err as Error).message, '看起来是 LiteShell 的 bug'))
+      throw err
+    }
+  }
+
+  /**
+   * Puts an external client's turn in the AI panel: what the user asked for,
+   * what the client says it is about to do, the command, then the answer.
+   *
+   * Deliberately not part of `dispatch`: that path is the in-process agent,
+   * which already pushes its own events, and two writers would double every
+   * card. Only a request that came over the socket is a turn here.
+   */
+  private async beginTrace(
+    req: Req
+  ): Promise<{ finish: (res: unknown) => void } | null> {
+    // `conns` and `close` are not work on a machine: nothing to show.
+    if (!req.op || !req.conn || req.op === 'conns' || req.op === 'close') return null
+    const found = findConn(req.conn)
+    if ('err' in found) return null
+
+    // The tab is opened first, in `session()`, so the panel exists to draw into.
+    // A call that arrives before any tab is up still gets an entry: it just
+    // shows when the transcript is next replayed.
+    let sessionId: string
+    try {
+      const live = await this.session(found.conn, req.sessionId)
+      // A failed connect is reported by dispatch with the full diagnosis; the
+      // transcript has nothing useful to add before it.
+      if (typeof live !== 'string') return null
+      sessionId = live
+    } catch {
+      return null
+    }
+
+    const intent = (req.intent ?? '').trim()
+    if (intent && this.lastIntent.get(sessionId) !== intent) {
+      this.lastIntent.set(sessionId, intent)
+      this.trace(sessionId, { kind: 'user', text: intent, source: 'cli' })
+    }
+    const op = describeOp(req)
+    this.trace(sessionId, { kind: 'assistant', text: (req.say ?? '').trim() || op.say, source: 'cli' })
+    this.trace(sessionId, { kind: 'tool', name: op.name, detail: op.detail, source: 'cli' })
+
+    return {
+      finish: (res: unknown) => {
+        const { ok, text } = summarize(req, res)
+        this.trace(sessionId, { kind: 'result', name: op.name, ok, summary: text })
+        this.trace(sessionId, { kind: 'done' })
+      }
+    }
   }
 
   /**

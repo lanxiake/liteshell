@@ -42,6 +42,7 @@
     "test:commands": "node scripts/test-commands.mjs",
     "test:alerts": "node scripts/test-alerts.mjs",
     "test:compact": "node scripts/test-compact.mjs",
+    "test:cli-trace": "node scripts/test-cli-trace.mjs",
     "test:presets": "node scripts/test-presets.mjs",
     "test:skill": "node scripts/test-skill.mjs",
     "sha256": "node scripts/make-sha256.mjs"

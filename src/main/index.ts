@@ -782,9 +782,14 @@ void app.whenReady().then(() => {
   manager = new SshManager(emit)
   desktop = new DesktopManager()
   // Sessions the CLI opens get a tab too, so the user can watch the agent work —
-  // and take over the moment it gets something wrong.
-  cli = new CliServer(manager, (connectionId, sessionId) =>
-    emit({ type: 'cli-session', sessionId, connectionId })
+  // and take over the moment it gets something wrong. The same tab's AI panel
+  // shows the turn: user words → what the client decided → the command → its
+  // output, which is the only way to watch an agent that lives in another
+  // process instead of this one.
+  cli = new CliServer(
+    manager,
+    (connectionId, sessionId) => emit({ type: 'cli-session', sessionId, connectionId }),
+    (sessionId, event) => emit({ type: 'agent', sessionId, event })
   )
   cli.listen()
   // The agent can write the connection list too, out of band from this window.

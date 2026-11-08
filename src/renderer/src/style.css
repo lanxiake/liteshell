@@ -39,14 +39,15 @@ body {
 }
 
 body {
-  display: flex;
-  flex-direction: column;
-  background: var(--bg);
-  color: var(--text);
-  font: 13px/1.5 "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
-  /* Text is selectable by default so anything on screen can be copied out; the
-     chrome below opts back out, where a drag is a click, not a selection. */
-  user-select: text;
+display: flex;
+flex-direction: column;
+background: var(--bg);
+color: var(--text);
+font: 13px/1.5 "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
+/* Text is selectable by default so anything on screen can be copied out; the
+chrome below opts back out, where a drag is a click, not a selection. */
+user-select: text;
+position: relative;
 }
 
 button,
@@ -1577,6 +1578,15 @@ body[data-platform="mac"] .agent-standalone .agent-head {
   box-shadow: 0 1px 0 color-mix(in srgb, var(--accent) 25%, transparent);
 }
 
+/* Same card, said by an external AI client driving the CLI rather than typed in
+   this panel. Dimmed because it is not this conversation's own turn: the model
+   here never saw it, and a paper trail that looks like a prompt is a lie. */
+.agent-msg.user.cli {
+  background: color-mix(in srgb, var(--text-faint) 12%, var(--bg));
+  box-shadow: none;
+  color: var(--text-dim);
+}
+
 .agent-hint {
   margin: 6px 2px 10px;
   padding: 10px 12px;
@@ -1606,6 +1616,14 @@ body[data-platform="mac"] .agent-standalone .agent-head {
   background: none;
   color: var(--text-dim);
   font-size: 12px;
+}
+
+/* Said by the external AI client driving the CLI: same preamble voice, marked
+   with a small arrow so a line the user did not type and this panel's model
+   did not write still has an author. */
+.agent-msg.assistant.interim.cli::before {
+  content: "↳ ";
+  opacity: 0.6;
 }
 
 .agent-msg.assistant.streaming::after {

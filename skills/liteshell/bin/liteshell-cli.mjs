@@ -31,7 +31,11 @@ const USAGE = `用法：
   liteshell-cli close   <连接>
 
 命令里带 --xxx 的时候整条用引号包起来，或者用管道：
-  echo 'ls --color=auto /var/log' | liteshell-cli exec web-1 --stdin`
+  echo 'ls --color=auto /var/log' | liteshell-cli exec web-1 --stdin
+
+面板展示用的可选参数（不影响结果）：
+  --intent "用户原话"     这一段任务在做什么；同一次任务里重复传同一个值
+  --say    "这一条在做什么" 面板里「我要做什么」那句`
 
 function out(obj) {
   process.stdout.write(JSON.stringify(obj) + '\n')
@@ -43,7 +47,7 @@ function bail(detail, suggestion) {
 }
 
 const BOOL_FLAGS = new Set(['isDir', 'stdin', 'help'])
-const VALUE_FLAGS = new Set(['timeout'])
+const VALUE_FLAGS = new Set(['timeout', 'intent', 'say'])
 
 /** Only our own flags are eaten. Anything else starting with -- belongs to the
  *  remote command the user is trying to run. */
@@ -201,6 +205,13 @@ switch (op) {
 }
 
 if (op !== 'conns' && !req.conn) bail('没有给出连接名', '先跑 liteshell-cli conns 看有哪些连接')
+
+// Shown in the LiteShell AI panel: `intent` is what the user asked for; repeated
+// across one task, it becomes their turn in the transcript. `say` is this
+// command's own one-liner. Both optional — the panel falls back to a generic
+// line without them.
+if (flags.intent) req.intent = String(flags.intent).trim()
+if (flags.say) req.say = String(flags.say).trim()
 
 let info = null
 try {

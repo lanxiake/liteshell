@@ -3,6 +3,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import { SearchAddon } from '@xterm/addon-search'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import '@xterm/xterm/css/xterm.css'
+import './animations.css'
 import './style.css'
 import {
   hintFor,
@@ -3151,6 +3152,18 @@ function handleEvent(ev: SessionEvent): void {
 
   if (ev.type === 'agent') {
     renderAgent(session, ev.event)
+    // The CLI is doing something: bring the transcript forward on the tab the
+    // user is looking at, or the commands run in a panel they cannot see. Only
+    // the active tab — opening a background tab's panel answers a click that
+    // never happened.
+    if (
+      ev.event.kind === 'user' &&
+      ev.event.source === 'cli' &&
+      session.id === activeId &&
+      !agentOpen
+    ) {
+      toggleAgent(session)
+    }
     return
   }
   if (ev.type === 'agent-convo') {
@@ -4607,7 +4620,6 @@ function buildAgent(standalone = false): AgentView {
   const log = el('div', 'agent-log')
   log.append(agentHint())
   root.append(veil, drawer, log)
-
   // The panel is reachable before anything is configured — the whole feature
   // hiding behind a key nobody knows to set is how you ship an AI nobody finds.
   // What it opens onto has to be a next step, not an empty box.
@@ -4893,9 +4905,13 @@ function addRow(view: AgentView, node: HTMLElement): void {
 }
 
 function addAgentRow(view: AgentView, cls: string, text: string): HTMLElement {
-  const row = el('div', `agent-msg ${cls}`, text)
-  addRow(view, row)
-  return row
+const row = el('div', `agent-msg ${cls}`, text)
+// 为 AI 消息添加淡入上浮动画
+if (cls.includes('assistant')) {
+row.classList.add('agent-message', 'incoming')
+}
+addRow(view, row)
+return row
 }
 
 /** One tool call with its output folded underneath. The command and what it
@@ -4946,12 +4962,12 @@ function renderAgent(session: Session, ev: AgentEvent): void {
   }
 
   switch (ev.kind) {
-    case 'user':
+    case 'user': {
       // Echoed by main, so it lands in every window open on this conversation
       // and in the stored transcript with the same wording.
       addAgentRow(
         view,
-        'user',
+        ev.source === 'cli' ? 'user cli' : 'user',
         ev.files?.length ? `${ev.text}\n📎 ${ev.files.map(baseName).join('、')}` : ev.text
       )
       // First thing said in a fresh conversation names it, here as well as in
@@ -4965,7 +4981,9 @@ function renderAgent(session: Session, ev: AgentEvent): void {
       if (view.working) view.log.append(view.working)
       // A new turn's preamble demotes its own text only, never the last answer.
       view.lastAnswer = null
+      if (ev.source === 'cli') syncAgentEntry(session)
       break
+    }
     case 'delta': {
       if (!view.live) view.live = addAgentRow(view, 'assistant streaming', '')
       // Plain text while it types: re-parsing half a fence on every token
@@ -4974,6 +4992,13 @@ function renderAgent(session: Session, ev: AgentEvent): void {
       break
     }
     case 'assistant': {
+      // A CLI turn has no model in this panel: the line the external client
+      // sent is its whole say about this command, and `settleAssistant` would
+      // turn it into a card that looks like an answer. Shown as preamble.
+      if (ev.source === 'cli') {
+        addAgentRow(view, 'assistant interim cli', ev.text)
+        break
+      }
       // Everything already arrived as deltas; this is the settled value, and
       // rendering it is idempotent for the normal case.
       if (!view.live) view.live = addAgentRow(view, 'assistant', '')
@@ -5106,11 +5131,15 @@ function closeAgentAsk(card: HTMLElement, label: string): void {
 function syncAgentEntry(session: Session): void {
   if (!session.agent) return
   const ready = !!store.settings.llm?.model?.trim()
-  session.agent.setup.hidden = ready
+  // A key is what the panel's own chat needs. An external AI client driving the
+  // CLI gets its turns shown here with no model configured at all, and hiding
+  // that transcript behind a key would hide exactly the people using the CLI.
+  const hasTalk = !!session.agent.log.querySelector('.agent-msg, .agent-step, .agent-ask')
+  session.agent.setup.hidden = ready || hasTalk
   session.agent.compose.hidden = !ready
   // The transcript stays in the DOM either way: the conversation in the main
   // process outlives the key being edited.
-  session.agent.log.hidden = !ready
+  session.agent.log.hidden = !(ready || hasTalk)
 }
 
 /* ------------------------------------------------------------------ *
@@ -5336,9 +5365,14 @@ function archiveRows(events: AgentEvent[]): HTMLElement[] {
   for (const ev of events) {
     switch (ev.kind) {
       case 'user':
-        out.push(el('div', 'agent-msg user', ev.files?.length ? `${ev.text}\n📎 ${ev.files.map(baseName).join('、')}` : ev.text))
+        out.push(el('div', `agent-msg user${ev.source === 'cli' ? ' cli' : ''}`, ev.files?.length ? `${ev.text}\n📎 ${ev.files.map(baseName).join('、')}` : ev.text))
         break
       case 'assistant': {
+        // Same rule as the live turn: a CLI line is preamble, not an answer.
+        if (ev.source === 'cli') {
+          out.push(el('div', 'agent-msg assistant interim cli', ev.text))
+          break
+        }
         const row = el('div', 'agent-msg assistant md')
         row.append(renderMarkdown(ev.text))
         out.push(row)

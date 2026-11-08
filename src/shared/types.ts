@@ -698,13 +698,17 @@ export interface Api {
  */
 export type AgentEvent =
   /** What the user sent. Emitted by main so every window — and the stored
-   *  transcript — has the same record of the turn. */
-  | { kind: 'user'; text: string; files?: string[] }
+   *  transcript — has the same record of the turn.
+   *
+   *  `source: 'cli'` marks a turn that came from an external AI client driving
+   *  the CLI rather than from this panel's own model. Same transcript, same
+   *  renderer; the mark only says where the words came from. */
+  | { kind: 'user'; text: string; files?: string[]; source?: 'cli' }
   /** Text streaming out of the model, appended to the message already shown. */
   | { kind: 'delta'; text: string }
-  | { kind: 'assistant'; text: string }
+  | { kind: 'assistant'; text: string; source?: 'cli' }
   /** A tool is about to run without asking (read-only). */
-  | { kind: 'tool'; name: string; detail: string }
+  | { kind: 'tool'; name: string; detail: string; source?: 'cli' }
   | { kind: 'result'; name: string; ok: boolean; summary: string }
   /** Parked: nothing happens until the user answers. Answered cards are
    *  resolved by whoever clicked them; anything still open when `done` arrives
