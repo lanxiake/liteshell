@@ -1532,6 +1532,35 @@ function folderDialog(existing: Folder | null, parentId: string | null): void {
  * settings
  * ------------------------------------------------------------------ */
 
+/**
+ * 设置页可折叠分区：标题条可点，收起时只留一行仪器感抬头。
+ */
+function settingsSection(
+  title: string,
+  code: string,
+  nodes: Array<Node | null | undefined>,
+  open = true
+): HTMLElement {
+  const sec = el('section', `settings-sec${open ? '' : ' folded'}`)
+  sec.dataset.code = code
+  const head = el('button', 'settings-sec-head')
+  head.type = 'button'
+  const tag = el('span', 'settings-sec-code', code)
+  const label = el('span', 'settings-sec-title', title)
+  const chevron = el('span', 'settings-sec-chevron', open ? '▾' : '▸')
+  head.append(tag, label, el('span', 'spacer'), chevron)
+  head.title = open ? '收起此分区' : '展开此分区'
+  const body = el('div', 'settings-sec-body')
+  for (const n of nodes) if (n) body.append(n)
+  head.addEventListener('click', () => {
+    const folded = sec.classList.toggle('folded')
+    chevron.textContent = folded ? '▸' : '▾'
+    head.title = folded ? '展开此分区' : '收起此分区'
+  })
+  sec.append(head, body)
+  return sec
+}
+
 function settingsDialog(): void {
   const s = store.settings
   const theme = select(Object.keys(THEMES).map((k) => [k, k]), s.theme)
@@ -1789,62 +1818,68 @@ function settingsDialog(): void {
   const keyRow = el('div', 'key-row')
   keyRow.append(apiKey, forget)
 
-  const body = el('div')
-  body.style.display = 'grid'
-  body.style.gap = '12px'
-  body.append(
-    field('配色', theme),
-    field('字体', font),
-    (() => {
-      const grid = el('div', 'grid2')
-      grid.append(field('字号', size), field('光标', cursor))
-      return grid
-    })(),
-    (() => {
-      const grid = el('div', 'grid2')
-      grid.append(field('光标闪烁', blink), field('回滚行数', scrollback))
-      return grid
-    })(),
-    (() => {
-      const grid = el('div', 'grid2')
-      grid.append(field('选中即复制', copyOnSelect))
-      return grid
-    })(),
-    field('终端背景图片', bgRow),
-    el('div', 'field-sep', 'AI 助手'),
-    field('协议', provider),
-    field('厂商预设', vendor),
-    vendorNote,
-    field('接口地址', urlRow),
-    field('模型', modelRow),
-    field('上下文窗口（K）', context),
-    note,
-    field('API Key', keyRow),
-    el('div', 'field-sep', '给别的 AI 客户端用'),
-    (() => {
-      const row = el('div', 'row-inline')
-      const btn = el('button', 'btn', '导出 CLI + 技能包')
-      btn.title = '把这个目录交给 Claude Code / Cline 等客户端，它们就能通过 LiteShell 操作服务器'
-      const note2 = el('span', 'mon-sub', '含 SKILL.md、CLI 和安装说明')
-      btn.addEventListener('click', () => {
-        void api.exportSkill().then((dir) => {
-          if (!dir) return
-          note2.textContent = `已导出到 ${dir}`
-        })
+  const termGridA = el('div', 'grid2')
+  termGridA.append(field('字号', size), field('光标', cursor))
+  const termGridB = el('div', 'grid2')
+  termGridB.append(field('光标闪烁', blink), field('回滚行数', scrollback))
+  const termGridC = el('div', 'grid2')
+  termGridC.append(field('选中即复制', copyOnSelect))
+
+  const skillRow = el('div', 'row-inline')
+  {
+    const btn = el('button', 'btn', '导出 CLI + 技能包')
+    btn.title = '把这个目录交给 Claude Code / Cline 等客户端，它们就能通过 LiteShell 操作服务器'
+    const note2 = el('span', 'mon-sub', '含 SKILL.md、CLI 和安装说明')
+    btn.addEventListener('click', () => {
+      void api.exportSkill().then((dir) => {
+        if (!dir) return
+        note2.textContent = `已导出到 ${dir}`
       })
-      row.append(btn, note2)
-      return row
-    })(),
-    el('div', 'field-sep', '更新'),
-    (() => {
-      const row = el('div', 'row-inline')
-      const check = el('button', 'btn', '检查更新')
-      check.addEventListener('click', () => void updateDialog())
-      const version = el('span', 'mon-sub', '')
-      void api.appVersion().then((v) => (version.textContent = `当前版本 ${v}`))
-      row.append(check, version)
-      return row
-    })()
+    })
+    skillRow.append(btn, note2)
+  }
+
+  const updateRow = el('div', 'row-inline')
+  {
+    const check = el('button', 'btn', '检查更新')
+    check.addEventListener('click', () => void updateDialog())
+    const version = el('span', 'mon-sub', '')
+    void api.appVersion().then((v) => (version.textContent = `当前版本 ${v}`))
+    updateRow.append(check, version)
+  }
+
+  const body = el('div', 'settings-body')
+  body.append(
+    settingsSection(
+      '终端外观',
+      'TERM',
+      [
+        field('配色', theme),
+        field('字体', font),
+        termGridA,
+        termGridB,
+        termGridC,
+        field('终端背景图片', bgRow)
+      ],
+      true
+    ),
+    settingsSection(
+      'AI 助手',
+      'AGENT',
+      [
+        field('协议', provider),
+        field('厂商预设', vendor),
+        vendorNote,
+        field('接口地址', urlRow),
+        field('模型', modelRow),
+        field('上下文窗口（K）', context),
+        note,
+        field('API Key', keyRow)
+      ],
+      true
+    ),
+    settingsSection('CLI / 技能包', 'SKILL', [skillRow], false),
+    settingsSection('更新', 'UPDATE', [updateRow], false)
   )
 
   showModal('设置', body, [

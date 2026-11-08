@@ -2339,6 +2339,90 @@ body[data-platform="mac"] .agent-standalone .agent-head {
   color: var(--text-dim);
 }
 
+/* ---------- settings accordion ---------- */
+
+.modal:has(.settings-body) {
+  width: 520px;
+}
+
+.settings-body {
+  display: grid;
+  gap: 10px;
+}
+
+.settings-sec {
+  border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border));
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--bg) 70%, var(--bg-panel));
+  overflow: hidden;
+}
+
+.settings-sec-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 9px 12px;
+  border: 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 14%, var(--border));
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--accent) 10%, transparent), transparent 42%),
+    color-mix(in srgb, var(--bg-panel) 92%, #000);
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+}
+
+.settings-sec-head:hover {
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--accent) 16%, transparent), transparent 50%),
+    var(--bg-hover);
+}
+
+.settings-sec-head:active {
+  transform: translateY(1px);
+}
+
+.settings-sec.folded .settings-sec-head {
+  border-bottom-color: transparent;
+}
+
+.settings-sec-code {
+  flex: none;
+  padding: 1px 6px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+  border-radius: 2px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--accent);
+  line-height: 16px;
+}
+
+.settings-sec-title {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.06em;
+}
+
+.settings-sec-chevron {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.settings-sec-body {
+  display: grid;
+  gap: 12px;
+  padding: 12px 14px 14px;
+}
+
+.settings-sec.folded .settings-sec-body {
+  display: none;
+}
+
 /* Release notes: Markdown from GitHub, shown as text — it is prose, and the
    dialog is not a browser. */
 .update-notes {
