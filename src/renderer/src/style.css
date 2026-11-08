@@ -8,8 +8,9 @@
   --text: #c9d1dd;
   --text-dim: #8b95a5;
   --text-faint: #5d6675;
-  --accent: #5b8cff;
-  --accent-dim: #2f4a8a;
+  --accent: #4cc9f0;
+  --accent-dim: #1a6b7a;
+  --font-mono: "Cascadia Mono", "JetBrains Mono", Consolas, "Sarasa Mono SC", monospace;
   --danger: #e5534b;
   --ok: #3fb950;
   --warn: #d29922;
@@ -17,7 +18,7 @@
   --type-media: #bc8cff;
   --type-code: #39c5cf;
   --titlebar-h: 40px;
-  --radius: 8px;
+  --radius: 5px;
 }
 
 * {
@@ -72,6 +73,21 @@ button {
   cursor: pointer;
 }
 
+.icon-btn:active,
+.tab:active,
+.node:active,
+.tbtn:active {
+  transform: translateY(1px);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+}
+
+.icon-btn:hover,
+.tab:hover,
+.node:hover {
+  outline: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  outline-offset: -1px;
+}
+
 .spacer {
   flex: 1;
 }
@@ -92,8 +108,10 @@ button {
   height: var(--titlebar-h);
   flex: 0 0 var(--titlebar-h);
   padding: 0 10px;
-  background: var(--bg);
-  border-bottom: 1px solid var(--border);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--accent) 8%, var(--bg)) 0%, var(--bg) 100%);
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+  box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
 body[data-platform="win"] #titlebar,
@@ -106,43 +124,151 @@ body[data-platform="mac"] #titlebar {
 }
 
 .brand {
+  font-family: var(--font-mono);
   font-weight: 600;
-  letter-spacing: 0.3px;
-  color: var(--text);
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent);
 }
 
 .brand::before {
   content: "";
   display: inline-block;
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
   margin-right: 8px;
-  border-radius: 50%;
+  border-radius: 1px;
   background: var(--accent);
-  box-shadow: 0 0 10px var(--accent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 50%, transparent);
   vertical-align: middle;
+  animation: brand-pulse 2.4s ease-in-out infinite;
+}
+
+@keyframes brand-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
 }
 
 .icon-btn {
   -webkit-app-region: no-drag;
   width: 28px;
   height: 28px;
-  border-radius: 6px;
+  border-radius: 4px;
   color: var(--text-dim);
-  display: grid;
-  place-items: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
   font-size: 14px;
+  border: 1px solid transparent;
 }
 
 .icon-btn:hover {
-  background: var(--bg-hover);
-  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-hover));
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 28%, transparent);
 }
 
 .icon-btn.txt {
   width: auto;
   padding: 0 9px;
   font-size: 11px;
+  letter-spacing: 0.06em;
+}
+
+/* 线框图标：跟随 currentColor，直角描边更有仪器感 */
+.ui-icon {
+  width: 15px;
+  height: 15px;
+  flex: none;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.65;
+  stroke-linecap: square;
+  stroke-linejoin: miter;
+  vector-effect: non-scaling-stroke;
+}
+
+.ui-icon-label {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.side-title {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.tbtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.tbtn .ui-icon {
+  width: 13px;
+  height: 13px;
+}
+
+.agent-icon .ui-icon,
+.agent-clip .ui-icon,
+.agent-go .ui-icon {
+  width: 14px;
+  height: 14px;
+}
+
+.agent-go,
+.agent-icon,
+.agent-clip,
+.panel-x,
+.tab .close,
+.agent-new {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+}
+
+.panel-x .ui-icon,
+.tab .close .ui-icon {
+  width: 12px;
+  height: 12px;
+}
+
+.key-icon {
+  display: inline-flex;
+  color: var(--accent);
+}
+
+.key-icon .ui-icon {
+  width: 16px;
+  height: 16px;
+}
+
+.nm .ui-icon,
+.crumb-icon .ui-icon {
+  width: 12px;
+  height: 12px;
+  vertical-align: -1px;
+  display: inline-block;
+  margin-right: 2px;
+}
+
+.crumb-icon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--accent);
 }
 
 /* ---------- layout ---------- */
@@ -158,8 +284,10 @@ body[data-platform="mac"] #titlebar {
   flex: 0 0 auto;
   display: flex;
   flex-direction: column;
-  background: var(--bg-side);
-  border-right: 1px solid var(--border);
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--accent) 4%, var(--bg-side)), var(--bg-side) 40%),
+    var(--bg-side);
+  border-right: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
   min-width: 160px;
 }
 
@@ -315,7 +443,7 @@ body.side-off #resizer {
 
 .node.live .dot {
   background: var(--ok);
-  box-shadow: 0 0 6px var(--ok);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--ok) 60%, transparent);
 }
 
 .node.failed .dot {
@@ -367,7 +495,9 @@ body.side-off #resizer {
   max-width: 220px;
   border-right: 1px solid var(--border);
   color: var(--text-dim);
-  font-size: 12px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  letter-spacing: 0.02em;
   white-space: nowrap;
 }
 
@@ -387,7 +517,13 @@ body.side-off #resizer {
 
 .tab.live .tdot {
   background: var(--ok);
-  box-shadow: 0 0 6px var(--ok);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--ok) 60%, transparent);
+}
+
+/* 就绪瞬间的闸门闪：边框动画由 animations.css 的 gate-lock 驱动 */
+.tab.gate-lock,
+.node.gate-lock {
+  border-color: var(--accent);
 }
 
 .tab.failed .tdot {
@@ -1194,8 +1330,23 @@ body.side-off #resizer {
      smaller than its transcript, or the transcript wins and the window clips. */
   min-height: 0;
   position: relative;
-  border-left: 1px solid var(--border);
-  background: var(--bg);
+  border-left: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--accent) 5%, var(--bg)) 0%, var(--bg) 48px, var(--bg) 100%);
+  box-shadow: inset 1px 0 0 color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.agent::before {
+  content: "OPS LINK";
+  position: absolute;
+  top: 8px;
+  right: 14px;
+  z-index: 1;
+  pointer-events: none;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  color: color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
 /* Straddles the panel's left edge rather than sitting beside it, so it is
@@ -1582,9 +1733,30 @@ body[data-platform="mac"] .agent-standalone .agent-head {
    this panel. Dimmed because it is not this conversation's own turn: the model
    here never saw it, and a paper trail that looks like a prompt is a lie. */
 .agent-msg.user.cli {
-  background: color-mix(in srgb, var(--text-faint) 12%, var(--bg));
+  align-self: stretch;
+  max-width: 100%;
+  margin: 4px 0 2px;
+  padding: 8px 10px 8px 12px;
+  border-radius: 2px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  border-left: 3px solid var(--accent);
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--accent) 12%, transparent), transparent 55%),
+    color-mix(in srgb, var(--bg-panel) 90%, #000);
   box-shadow: none;
-  color: var(--text-dim);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+}
+
+.agent-msg.user.cli::before {
+  content: "MISSION · CLI";
+  display: block;
+  margin-bottom: 4px;
+  color: var(--accent);
+  font-size: 10px;
+  letter-spacing: 0.12em;
 }
 
 .agent-hint {
@@ -1621,9 +1793,21 @@ body[data-platform="mac"] .agent-standalone .agent-head {
 /* Said by the external AI client driving the CLI: same preamble voice, marked
    with a small arrow so a line the user did not type and this panel's model
    did not write still has an author. */
+.agent-msg.assistant.interim.cli {
+  margin: 2px 0 4px;
+  padding: 4px 0 4px 10px;
+  border-left: 1px dashed color-mix(in srgb, var(--accent) 45%, var(--border));
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
 .agent-msg.assistant.interim.cli::before {
-  content: "↳ ";
-  opacity: 0.6;
+  content: "SAY › ";
+  color: var(--accent);
+  opacity: 0.85;
+  letter-spacing: 0.08em;
+  font-size: 10px;
 }
 
 .agent-msg.assistant.streaming::after {
@@ -1713,12 +1897,78 @@ body[data-platform="mac"] .agent-standalone .agent-head {
    transcript reads as a list of steps instead of two alternating colours that
    never told you which output belonged to which command. */
 .agent-step {
-  border-left: 2px solid var(--border);
-  border-radius: 0 4px 4px 0;
+  position: relative;
+  margin: 2px 0;
+  padding: 4px 6px 4px 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border));
+  border-left: 2px solid color-mix(in srgb, var(--accent) 55%, var(--border));
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--bg-panel) 88%, #000);
+}
+
+/* 执行中进度轨：贴在左边框上，一段亮条往返行进 */
+.agent-step-rail {
+  position: absolute;
+  left: -2px;
+  top: 0;
+  width: 2px;
+  height: 0;
+  background: var(--accent);
+  pointer-events: none;
+}
+
+.agent-step.running {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.agent-step.running .agent-step-rail {
+  height: 40%;
+  animation: rail-travel 1.1s ease-in-out infinite alternate;
+}
+
+/* 等宽操作标签 + 明细 + 右侧读数同排 */
+.agent-op-tag {
+  flex: none;
+  padding: 1px 6px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  line-height: 16px;
+  font-weight: 600;
+}
+
+.agent-op-detail {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-op-readout {
+  flex: none;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-op-readout[hidden] {
+  display: none;
+}
+
+.agent-step.bad .agent-op-tag {
+  border-color: var(--danger);
+  color: var(--danger);
 }
 
 .agent-step-head {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   width: 100%;
   padding: 2px 0 2px 8px;
   border: 0;
@@ -1737,12 +1987,14 @@ body[data-platform="mac"] .agent-standalone .agent-head {
   user-select: none;
 }
 
+/* 折叠箭头作为 flex 首项，不挤占明细省略号 */
 .agent-step-head::before {
-  content: "▾ ";
+  content: "▾";
+  flex: none;
 }
 
 .agent-step.folded .agent-step-head::before {
-  content: "▸ ";
+  content: "▸";
 }
 
 .agent-step-head:hover {
@@ -2556,13 +2808,28 @@ kbd {
   display: flex;
   align-items: center;
   gap: 10px;
-  height: 24px;
-  flex: 0 0 24px;
+  height: 26px;
+  flex: 0 0 26px;
   padding: 0 12px;
-  background: var(--bg);
-  border-top: 1px solid var(--border);
+  background:
+    linear-gradient(0deg, color-mix(in srgb, var(--accent) 6%, var(--bg)) 0%, var(--bg) 100%);
+  border-top: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
   font-size: 11px;
   color: var(--text-faint);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+#status-text,
+#status-host {
+  font-family: var(--font-mono);
+  letter-spacing: 0.06em;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+#status-host {
+  color: var(--accent);
+  opacity: 0.85;
 }
 
 /* ---------- overlay / modal ---------- */
@@ -2580,14 +2847,40 @@ kbd {
   display: none;
 }
 
+/* 舱门入场：弹层显示时遮罩着色 + 弹窗轻微上浮缩放进入 */
+@keyframes hatch-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+#overlay:not([hidden]) {
+  background: color-mix(in srgb, #000 55%, transparent);
+}
+
+#overlay:not([hidden]) .modal {
+  animation: hatch-in 0.22s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #overlay:not([hidden]) .modal {
+    animation: none;
+  }
+}
+
 .modal {
   width: 480px;
   max-width: 92vw;
   max-height: 88vh;
   overflow: auto;
   background: var(--bg-panel);
-  border: 1px solid var(--border);
-  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 25%, var(--border));
+  border-radius: var(--radius);
   box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
 }
 

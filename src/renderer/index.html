@@ -11,31 +11,33 @@
   <body>
   <div class="particles-bg"></div>
   <header id="titlebar">
-      <button id="btn-side" class="icon-btn" title="收起/展开连接列表 (Ctrl+B)">☰</button>
+      <button id="btn-side" class="icon-btn" data-icon="side" title="收起/展开连接列表 (Ctrl+B)"></button>
       <span class="brand">LiteShell</span>
       <span class="spacer"></span>
-      <button id="btn-theme" class="icon-btn" title="切换主题">🎨</button>
-      <button id="btn-log" class="icon-btn txt" title="查看日志">日志</button>
-      <button id="btn-quick" class="icon-btn" title="命令面板">⌘</button>
-      <button id="btn-keyring" class="icon-btn" title="私钥管理">🔑</button>
-      <button id="btn-keys" class="icon-btn" title="快捷键一览 (Ctrl+/)">⌨</button>
-      <button id="btn-settings" class="icon-btn" title="设置">⚙</button>
+      <button id="btn-theme" class="icon-btn" data-icon="theme" title="切换主题"></button>
+      <button id="btn-log" class="icon-btn txt" data-icon="log" data-icon-label="1" title="查看日志">日志</button>
+      <button id="btn-quick" class="icon-btn" data-icon="command" title="命令面板"></button>
+      <button id="btn-keyring" class="icon-btn" data-icon="key" title="私钥管理"></button>
+      <button id="btn-keys" class="icon-btn" data-icon="keyboard" title="快捷键一览 (Ctrl+/)"></button>
+      <button id="btn-settings" class="icon-btn" data-icon="settings" title="设置"></button>
     </header>
 
     <div id="body">
       <aside id="sidebar">
         <div class="side-head">
-          <span>连接</span>
+          <span class="side-title">连接</span>
           <span class="spacer"></span>
           <button
             id="btn-import"
             class="icon-btn txt"
+            data-icon="import"
+            data-icon-label="1"
             title="从 FinalShell 导入：安装目录，或右键 → 导出得到的目录"
           >
             导入
           </button>
-          <button id="btn-new-folder" class="icon-btn" title="新建文件夹">🗀</button>
-          <button id="btn-new-conn" class="icon-btn" title="新建连接">＋</button>
+          <button id="btn-new-folder" class="icon-btn" data-icon="folder" title="新建文件夹"></button>
+          <button id="btn-new-conn" class="icon-btn" data-icon="plus" title="新建连接"></button>
         </div>
         <div class="side-search">
           <input
@@ -46,7 +48,7 @@
             spellcheck="false"
             title="按名称、主机/IP、用户名或端口过滤连接（Ctrl+F）"
           />
-          <button id="tree-search-clear" class="icon-btn" title="清空搜索" hidden>×</button>
+          <button id="tree-search-clear" class="icon-btn" data-icon="close" title="清空搜索" hidden></button>
         </div>
         <div id="tree" class="scroll"></div>
       </aside>

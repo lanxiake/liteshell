@@ -14,6 +14,8 @@ import {
 } from './commands'
 import { alertsFor, toneOf, usePct, type Tone } from './alerts'
 import { renderMarkdown } from './markdown'
+import { hudLine, buildAgentStep, completeAgentStep, cancelAgentStep } from './ceremony'
+import { icon, mountChromeIcons, setIcon, type IconName } from './icons'
 import { PRESETS, presetFor } from '../../shared/presets'
 import type {
   AgentEvent,
@@ -59,8 +61,8 @@ const THEMES: Record<string, Theme> = {
       text: '#c9d1dd',
       'text-dim': '#8b95a5',
       'text-faint': '#5d6675',
-      accent: '#5b8cff',
-      'accent-dim': '#2f4a8a',
+      accent: '#4CC9F0',
+      'accent-dim': '#1A6B7A',
       danger: '#e5534b',
       ok: '#3fb950',
       warn: '#d29922'
@@ -68,14 +70,14 @@ const THEMES: Record<string, Theme> = {
     term: {
       background: '#141821',
       foreground: '#c9d1dd',
-      cursor: '#5b8cff',
+      cursor: '#4CC9F0',
       cursorAccent: '#141821',
-      selectionBackground: '#2f4a8a',
+      selectionBackground: '#1A6B7A',
       black: '#1c2130',
       red: '#e5534b',
       green: '#3fb950',
       yellow: '#d29922',
-      blue: '#5b8cff',
+      blue: '#4CC9F0',
       magenta: '#bc8cff',
       cyan: '#39c5cf',
       white: '#b1bac4',
@@ -370,7 +372,8 @@ function uid(): string {
 /** The X on every side panel. The toolbar button that opened a panel sits at
  *  the far left, so closing it from the panel itself is the short way out. */
 function panelClose(title: string, run: () => void): HTMLElement {
-  const b = el('button', 'panel-x', '×')
+  const b = el('button', 'panel-x')
+  setIcon(b, 'close')
   b.title = title
   b.setAttribute('aria-label', title)
   b.addEventListener('click', run)
@@ -465,6 +468,9 @@ async function boot(): Promise<void> {
     : /Linux/.test(navigator.userAgent)
       ? 'linux'
       : 'win'
+
+  // 标题栏 / 侧栏静态按钮换成线框图标（HTML 里用 data-icon 标记）。
+  mountChromeIcons()
 
   store = await api.getStore()
   bgDataUrl = store.settings.backgroundImage ? await api.backgroundImage() : null
@@ -679,6 +685,8 @@ function renderTreeSearch(tree: HTMLElement, query: string): void {
     if ([...sessions.values()].some((s) => s.connectionId === conn.id && s.status === 'ready')) {
       node.classList.add('live')
     }
+    if (isConnectionConnecting(conn.id)) node.classList.add('connecting')
+    if (gateLockIds.has(conn.id)) node.classList.add('gate-lock')
     node.append(el('span', 'dot'), el('span', 'label', conn.name))
     node.append(el('span', 'sub', `${conn.username}@${conn.host}`))
     node.addEventListener('click', () => {
@@ -706,6 +714,14 @@ function renderTreeSearch(tree: HTMLElement, query: string): void {
   }
 }
 
+/** Connection ids whose sidebar node should show the gate-lock flash right now. */
+const gateLockIds = new Set<string>()
+
+/** True when any open session of the given connection is currently connecting. */
+function isConnectionConnecting(connectionId: string): boolean {
+  return [...sessions.values()].some((s) => s.connectionId === connectionId && s.status === 'connecting')
+}
+
 function renderTree(): void {
   const tree = $('#tree')
   tree.replaceChildren()
@@ -729,6 +745,8 @@ function renderTree(): void {
       const node = el('div', 'node')
       if (live) node.classList.add('live')
       if (failed) node.classList.add('failed')
+      if (!isFolder && isConnectionConnecting(item.id)) node.classList.add('connecting')
+      if (!isFolder && gateLockIds.has(item.id)) node.classList.add('gate-lock')
       if (item.id === selectedId) node.classList.add('sel')
       node.style.paddingLeft = `${8 + depth * 14}px`
       node.dataset.id = item.id
@@ -819,7 +837,7 @@ function renderTree(): void {
 
   if (!store.folders.length && !store.connections.length) {
     const hint = el('div', 'empty-hint')
-    hint.innerHTML = '还没有连接<br />点右上角 <b>＋</b> 新建'
+    hint.innerHTML = '还没有连接<br />点右上角 <b>+</b> 新建'
     tree.appendChild(hint)
   }
 }
@@ -2221,7 +2239,9 @@ function keyLabel(key: KeyFile): string {
 
 function keyItem(key: KeyFile): HTMLElement {
   const row = el('div', 'key-item')
-  row.append(el('span', 'key-icon', '🔑'))
+  const keyIco = el('span', 'key-icon')
+  keyIco.append(icon('key'))
+  row.append(keyIco)
   const text = el('div', 'key-text')
   text.append(
     el('div', 'key-name', key.name),
@@ -2699,8 +2719,16 @@ async function openSession(rawConn: Connection, externalId?: string): Promise<vo
   searchBar.hidden = true
 
   const toolbar = el('div', 'toolbar')
-  const tbtn = (label: string, act: string, title: string, run: () => void): HTMLElement => {
-    const b = el('button', 'tbtn', label)
+  const tbtn = (
+    label: string,
+    act: string,
+    title: string,
+    run: () => void,
+    ic?: IconName
+  ): HTMLElement => {
+    const b = el('button', 'tbtn')
+    if (ic) setIcon(b, ic, label)
+    else b.textContent = label
     b.dataset.act = act
     b.title = title
     b.addEventListener('click', run)
@@ -2806,8 +2834,12 @@ async function openSession(rawConn: Connection, externalId?: string): Promise<vo
     if (session.suggestItems.length) placeSuggest(session)
   }).observe(termBox)
 
-  const agentBtn = tbtn('AI', 'agent', '用自然语言操作这台机器；只有会删数据、覆盖文件的命令才停下来问你', () =>
-    toggleAgent(session)
+  const agentBtn = tbtn(
+    'AI',
+    'agent',
+    '用自然语言操作这台机器；只有会删数据、覆盖文件的命令才停下来问你',
+    () => toggleAgent(session),
+    'agent'
   )
   // Right-click on it opens the panel straight onto its history; a plain click
   // still opens the live conversation, which is where the work happens.
@@ -2823,13 +2855,13 @@ async function openSession(rawConn: Connection, externalId?: string): Promise<vo
   })
 
   toolbar.append(
-    tbtn('文件', 'files', 'SFTP 文件面板 (Ctrl+Shift+B)，文件可直接拖入上传', () => void toggleFiles(session)),
-    tbtn('监控', 'monitor', '服务器资源监控 (Ctrl+Shift+M)', () => toggleMonitor(session)),
+    tbtn('文件', 'files', 'SFTP 文件面板 (Ctrl+Shift+B)，文件可直接拖入上传', () => void toggleFiles(session), 'files'),
+    tbtn('监控', 'monitor', '服务器资源监控 (Ctrl+Shift+M)', () => toggleMonitor(session), 'monitor'),
     agentBtn,
-    tbtn('历史', 'history', '历史命令 (Ctrl+Shift+H)，输入时也有候选', () => historyDialog(session)),
-    tbtn('查找', 'find', '终端内查找 (Ctrl+Shift+F)', () => focusSearch(session)),
-    tbtn('清屏', 'clear', '清空屏幕 (Ctrl+Shift+K)', () => term.clear()),
-    tbtn('断开', 'close', '断开会话', () => void closeSession(sessionId))
+    tbtn('历史', 'history', '历史命令 (Ctrl+Shift+H)，输入时也有候选', () => historyDialog(session), 'history'),
+    tbtn('查找', 'find', '终端内查找 (Ctrl+Shift+F)', () => focusSearch(session), 'search'),
+    tbtn('清屏', 'clear', '清空屏幕 (Ctrl+Shift+K)', () => term.clear(), 'clear'),
+    tbtn('断开', 'close', '断开会话', () => void closeSession(sessionId), 'disconnect')
   )
 
   buildTab(session, pane)
@@ -2886,7 +2918,8 @@ function buildTab(session: Session, pane: HTMLElement): void {
   const tab = el('div', 'tab')
   tab.appendChild(el('span', 'tdot'))
   tab.appendChild(el('span', 'label', session.name))
-  const close = el('button', 'close', '×')
+  const close = el('button', 'close')
+  setIcon(close, 'close')
   close.addEventListener('click', (ev) => {
     ev.stopPropagation()
     void closeSession(session.id)
@@ -2902,11 +2935,44 @@ function buildTab(session: Session, pane: HTMLElement): void {
   $('#tabs').appendChild(tab)
 }
 
-/** The tab's dot: grey while connecting, green when up, red once it is not. */
+/**
+ * Applies a session status to its tab and the status bar: connecting pulses,
+ * ready flashes the gate-lock border once, closed/error turn red. SessionStatus
+ * and HudStatus share the same members, so the status feeds hudLine directly.
+ */
 function setStatus(session: Session, status: SessionStatus): void {
+  const prev = session.status
   session.status = status
+  session.tab.classList.toggle('connecting', status === 'connecting')
   session.tab.classList.toggle('live', status === 'ready')
   session.tab.classList.toggle('failed', status === 'closed' || status === 'error')
+  if (status === 'ready') {
+    // Remove, force reflow, re-add so the animation restarts on repeat connects.
+    session.tab.classList.remove('gate-lock')
+    void session.tab.offsetWidth
+    session.tab.classList.add('gate-lock')
+    // Sidebar node: renderTree() rebuilds every node right after this, so the id
+    // is also kept in gateLockIds and re-applied there until the flash is over.
+    const connId = session.connectionId
+    gateLockIds.add(connId)
+    const node = document.querySelector(`#tree .node[data-id="${connId}"]`)
+    if (node) {
+      node.classList.remove('gate-lock')
+      void (node as HTMLElement).offsetWidth
+      node.classList.add('gate-lock')
+    }
+    window.setTimeout(() => {
+      session.tab.classList.remove('gate-lock')
+      gateLockIds.delete(connId)
+      document.querySelector(`#tree .node[data-id="${connId}"]`)?.classList.remove('gate-lock')
+    }, 600)
+  }
+  // ssh2 reports a failed connection as error *then* close: keep LINK FAIL on the
+  // HUD instead of stomping it with LINK DOWN (tab classes above still update).
+  const keepFail = prev === 'error' && status === 'closed'
+  if (activeId === session.id && !keepFail) {
+    $('#status-text').textContent = hudLine(session.name, status)
+  }
 }
 
 function tabMenu(ev: MouseEvent, session: Session): void {
@@ -3085,6 +3151,7 @@ function activate(sessionId: string): void {
   })
   const conn = store.connections.find((c) => c.id === session.connectionId)
   $('#status-host').textContent = conn ? `${conn.username}@${conn.host}:${conn.port}` : ''
+  $('#status-text').textContent = hudLine(session.name, session.status)
 }
 
 /** Takes the tab out of this window. The connection stays up unless the caller
@@ -3195,7 +3262,6 @@ function handleEvent(ev: SessionEvent): void {
     settleSecret(ev.sessionId, session.name)
     // Keep a first-connection host key notice up so the fingerprint is actually readable.
     if (!session.notice.dataset.hostkey) session.notice.hidden = true
-    $('#status-text').textContent = `${session.name} 已连接`
     // Tab opened onto a live box: the panel is the point of the tab, so show it.
     // Guarded by activeId so a background attach doesn't start polling unseen.
     if (activeId === session.id) openMonitor(session)
@@ -3204,7 +3270,6 @@ function handleEvent(ev: SessionEvent): void {
     session.notice.hidden = false
     session.notice.classList.add('error')
     session.notice.textContent = `连接失败：${ev.error ?? '未知错误'}`
-    $('#status-text').textContent = `${session.name} 连接失败`
   } else if (ev.status === 'closed') {
     if (prevStatus === 'error') return
     log('info', `[${session.name}] 会话已断开`)
@@ -3449,13 +3514,14 @@ function historyDialog(session: Session): void {
 
 function buildFilePanel(session: Session): void {
   const head = el('div', 'files-head')
-  const btn = (label: string, title: string, run: () => void): HTMLElement => {
-    const b = el('button', 'icon-btn txt', label)
+  const btn = (ic: IconName, label: string, title: string, run: () => void): HTMLElement => {
+    const b = el('button', 'icon-btn txt')
+    setIcon(b, ic, label)
     b.title = title
     b.addEventListener('click', run)
     return b
   }
-  const more = btn('⋯', '更多操作', () => {
+  const more = btn('more', '', '更多操作', () => {
     const r = head.getBoundingClientRect()
     showMenu(r.right - 150, r.bottom + 2, [
       { label: '复制当前路径', run: () => copyPath(session.filePath) },
@@ -3466,10 +3532,10 @@ function buildFilePanel(session: Session): void {
     ])
   })
   head.append(
-    btn('⬅', '上一级 (Alt+↑)', () => void navigate(session, parentOf(session.filePath))),
-    btn('⟳', '刷新', () => void navigate(session, session.filePath)),
-    btn('🗀 新建', '新建目录', () => void mkdirHere(session)),
-    btn('⬆ 上传', '上传文件到当前目录（也可以直接把文件拖进来）', () => void uploadHere(session)),
+    btn('back', '', '上一级 (Alt+↑)', () => void navigate(session, parentOf(session.filePath))),
+    btn('refresh', '', '刷新', () => void navigate(session, session.filePath)),
+    btn('folder', '新建', '新建目录', () => void mkdirHere(session)),
+    btn('upload', '上传', '上传文件到当前目录（也可以直接把文件拖进来）', () => void uploadHere(session)),
     more,
     panelClose('关闭文件面板', () => {
       session.files.classList.remove('open')
@@ -3483,10 +3549,12 @@ function buildFilePanel(session: Session): void {
   crumbs.title = '点击路径片段跳转；双击空白处可直接输入路径'
   const editPath = (): void => startPathEdit(session, pathbar, crumbs)
   crumbs.addEventListener('dblclick', editPath)
-  const pencil = el('button', 'icon-btn', '✎')
+  const pencil = el('button', 'icon-btn')
+  setIcon(pencil, 'edit')
   pencil.title = '输入路径跳转'
   pencil.addEventListener('click', editPath)
-  const copy = el('button', 'icon-btn', '⧉')
+  const copy = el('button', 'icon-btn')
+  setIcon(copy, 'copy')
   copy.title = '复制当前路径'
   copy.addEventListener('click', () => copyPath(session.filePath))
   pathbar.append(crumbs, pencil, copy)
@@ -3576,7 +3644,9 @@ async function navigate(session: Session, path: string): Promise<void> {
       // opening things to find out what they are.
       const row = el('div', `row${entry.isDir ? ' dir' : ''} ${fileKind(entry.name)}`)
       row.title = `${entry.path}\n${entry.isDir ? '双击进入' : '双击打开'}`
-      row.appendChild(el('span', 'nm', `${entry.isDir ? '🗀' : '·'} ${entry.name}`))
+      const nm = el('span', 'nm')
+      nm.append(icon(entry.isDir ? 'folder' : 'dot'), document.createTextNode(` ${entry.name}`))
+      row.appendChild(nm)
       row.appendChild(el('span', 'sz', entry.isDir ? '' : human(entry.size)))
       const pick = (): void => {
         list.querySelector('.sel')?.classList.remove('sel')
@@ -3643,7 +3713,9 @@ function renderCrumbs(session: Session): void {
   }
 
   const root = jump('/')
-  root.append(el('span', 'crumb-icon', '🗀'), el('span', 'crumb-text', '/'))
+  const crumbIcon = el('span', 'crumb-icon')
+  crumbIcon.append(icon('folder'))
+  root.append(crumbIcon, el('span', 'crumb-text', '/'))
   nodes.push(root)
   let so = ''
   parts.forEach((part, i) => {
@@ -4079,7 +4151,7 @@ function drawSpark(canvas: HTMLCanvasElement, values: number[], max: number): vo
   ctx.clearRect(0, 0, w, h)
 
   const style = getComputedStyle(document.documentElement)
-  const accent = style.getPropertyValue('--accent').trim() || '#5b8cff'
+  const accent = style.getPropertyValue('--accent').trim() || '#4CC9F0'
   const span = Math.max(1, max)
 
   // Until the buffer is full the samples stretch over the whole width, so the
@@ -4563,16 +4635,20 @@ function buildAgent(standalone = false): AgentView {
   // Three parts: what this conversation is, what it remembers, what it does.
   // A drawer button on the left is where every chat app puts history, and the
   // title changes with the conversation so the panel says which one is open.
-  const past = el('button', 'agent-icon', '☰')
+  const past = el('button', 'agent-icon')
+  setIcon(past, 'history')
   past.title = '历史对话（Ctrl+Shift+A）'
   past.setAttribute('aria-label', '历史对话')
   const title = el('span', 'agent-title', 'AI 助手')
   title.title = '当前对话'
-  const wide = el('button', 'agent-icon agent-wide', '⤢')
+  const wide = el('button', 'agent-icon agent-wide')
+  setIcon(wide, 'expand')
   wide.title = '占满整行，专看这边的命令和回复（再点一次还原）'
-  const popout = el('button', 'agent-icon', '⧉')
+  const popout = el('button', 'agent-icon')
+  setIcon(popout, 'popout')
   popout.title = '在独立窗口中打开 AI 面板'
-  const clear = el('button', 'agent-icon', '＋')
+  const clear = el('button', 'agent-icon')
+  setIcon(clear, 'plus')
   clear.title = '新对话（清空当前会话）'
   clear.setAttribute('aria-label', '新对话')
   const close = panelClose(standalone ? '关闭窗口' : '关闭 AI 面板', () => {})
@@ -4655,9 +4731,11 @@ function buildAgent(standalone = false): AgentView {
   filesRow.hidden = true
 
   const foot = el('div', 'agent-foot')
-  const attach = el('button', 'agent-clip', '＋')
+  const attach = el('button', 'agent-clip')
+  setIcon(attach, 'plus')
   attach.title = '添加附件：先传到服务器的 /tmp，再让它去读'
-  const go = el('button', 'agent-go', '↑')
+  const go = el('button', 'agent-go')
+  setIcon(go, 'send')
   go.title = '发送 (Enter)'
   foot.append(attach, el('span', 'agent-kbd-hint', 'Enter 发送 · Shift+Enter 换行'), go)
   box.append(filesRow, input, foot)
@@ -4862,7 +4940,7 @@ function renderAgentFiles(view: AgentView): void {
 function setAgentBusy(view: AgentView, busy: boolean): void {
   view.busy = busy
   view.go.classList.toggle('stop', busy)
-  view.go.textContent = busy ? '■' : '↑'
+  setIcon(view.go, busy ? 'stop' : 'send')
   view.go.title = busy ? '停止' : '发送 (Enter)'
   view.input.placeholder = busy
     ? '正在处理…'
@@ -4918,27 +4996,14 @@ return row
  *  printed are one event; two floating blocks never made that obvious, and
  *  pairing them is what lets a transcript be read back like a log. */
 function agentStep(name: string, detail: string): HTMLElement {
-  // Always folded, including the one-line command itself: a turn that ran ten
-  // tools is then ten short lines to scan, not ten wrapped command paragraphs
-  // pushing the answer off screen. The title is still the whole command on hover.
-  const box = el('div', 'agent-step folded')
-  const head = el('button', 'agent-step-head', detail.startsWith(name) ? detail : `${name}  ${detail}`)
-  head.type = 'button'
-  head.title = `${name}\n${detail}\n\n点开看完整输出`
-  const body = el('div', 'agent-step-body')
-  head.addEventListener('click', () => box.classList.toggle('folded'))
-  box.append(head, body)
-  return box
+  // Always folded (see ceremony.buildAgentStep): a ten-tool turn stays ten short
+  // lines to scan; the full command is still the tooltip.
+  return buildAgentStep(name, detail)
 }
 
+/** Settle a step: output, exit/ms readout, and open it only on failure. */
 function fillAgentStep(step: HTMLElement, ok: boolean, text: string): void {
-  step.classList.toggle('bad', !ok)
-  const body = step.querySelector('.agent-step-body')
-  if (body) body.textContent = text || '（无输出）'
-  // Stays folded whatever the length: the previous "long outputs fold, short
-  // ones don't" rule still let twenty short results push the conversation each
-  // turn. A failure is the one thing worth one click to see, so it opens.
-  if (!ok) step.classList.remove('folded')
+  completeAgentStep(step, ok, text)
 }
 
 /** The settled answer: swap the streamed plain text for rendered Markdown. */
@@ -5054,7 +5119,10 @@ function renderAgent(session: Session, ev: AgentEvent): void {
       // button, a dropped connection, or an error.
       if (view.open) closeAgentAsk(view.open.card, '已取消')
       view.open = null
+      // A tool card with no `result` would keep its progress rail running forever.
+      if (view.step) cancelAgentStep(view.step)
       view.step = null
+      view.log.querySelectorAll('.agent-step.running').forEach((s) => cancelAgentStep(s as HTMLElement))
       // A stopped answer never gets its `assistant` event, so settle whatever
       // had streamed: the caret should stop blinking even on half a reply.
       if (view.live) settleAssistant(view.live, view.live.textContent ?? '')
@@ -5191,7 +5259,8 @@ async function fillHistoryDrawer(
   const shown = q ? items.filter((i) => (i.title || '').toLowerCase().includes(q)) : items
   view.drawerList.replaceChildren()
 
-  const fresh = el('button', 'agent-new', '＋ 新对话')
+  const fresh = el('button', 'agent-new')
+  setIcon(fresh, 'plus', '新对话')
   fresh.addEventListener('click', () => {
     closeHistoryDrawer(view)
     const live = [...sessions.values()].find((s) => s.agent === view)
@@ -5383,6 +5452,7 @@ function archiveRows(events: AgentEvent[]): HTMLElement[] {
         // Same demotion as the live turn: text a tool call follows is preamble.
         answer?.classList.add('interim')
         answer = null
+        if (open) cancelAgentStep(open)
         open = agentStep(ev.name, ev.detail)
         out.push(open)
         break
@@ -5414,6 +5484,8 @@ function archiveRows(events: AgentEvent[]): HTMLElement[] {
         break
     }
   }
+  // A tool with no recorded result (stopped / dropped) must not replay as running.
+  if (open) cancelAgentStep(open)
   return out
 }
 
@@ -5629,7 +5701,7 @@ const SHORTCUTS: [string, string][] = [
   ['Ctrl + T', '新建连接'],
   ['Ctrl + B', '收起 / 展开连接列表'],
   ['Ctrl + F', '搜索连接（名称、IP、用户名）'],
-  ['⌘ / 🔑', '命令面板 / 私钥管理'],
+  ['命令 / 私钥', '命令面板 / 私钥管理'],
   ['Ctrl + ,', '设置'],
   ['Ctrl + /', '快捷键一览'],
   ['Ctrl + Tab / Ctrl + Shift + Tab', '切换标签'],

@@ -230,15 +230,30 @@
   75% { transform: translateX(4px); }
 }
 
-.node.connecting .dot {
-  animation: pulse-glow 0.8s ease-in-out infinite;
-  color: var(--accent);
+/* 握手扫线：连接中圆点的细边框呼吸 */
+@keyframes handshake-scan {
+  0% { box-shadow: 0 0 0 0 var(--accent); opacity: 0.55; }
+  50% { box-shadow: 0 0 0 1px var(--accent); opacity: 1; }
+  100% { box-shadow: 0 0 0 0 var(--accent); opacity: 0.55; }
+}
+
+/* 闸门闪：就绪瞬间整行/整标签内边框闪一下 */
+@keyframes gate-lock {
+  0% { box-shadow: inset 0 0 0 1px transparent; }
+  30% { box-shadow: inset 0 0 0 1px var(--accent); }
+  100% { box-shadow: inset 0 0 0 1px transparent; }
+}
+
+.node.connecting .dot,
+.tab.connecting .tdot {
+  animation: handshake-scan 0.45s ease-in-out infinite;
+  background: color-mix(in srgb, var(--accent) 70%, var(--text-faint));
 }
 
 .node.live .dot {
   animation: scale-bounce 0.6s ease-in-out;
   background: var(--ok);
-  box-shadow: 0 0 6px var(--ok);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--ok) 60%, transparent);
 }
 
 .node.failed .dot {
@@ -246,33 +261,24 @@
   background: var(--danger);
 }
 
-.tab.connecting .tdot {
-  animation: pulse-glow 0.8s ease-in-out infinite;
-  color: var(--accent);
-}
-
 .tab.live .tdot {
   animation: scale-bounce 0.6s ease-in-out;
   background: var(--ok);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--ok) 60%, transparent);
 }
 
-/* ---- 命令输入提示符渐变 ---- */
-@keyframes gradient-shift {
-  0%, 100% {
-    background-position: 0% 50%;
-  }
-  50% {
-    background-position: 100% 50%;
-  }
+.tab.failed .tdot {
+  animation: shake 0.3s ease-in-out;
 }
 
+.tab.gate-lock,
+.node.live.gate-lock {
+  animation: gate-lock 0.55s ease-out;
+}
+
+/* ---- 命令输入提示符 ---- */
 .term-prompt {
-  background: linear-gradient(90deg, #5b8cff, #bc8cff, #5b8cff);
-  background-size: 200% 100%;
-  animation: gradient-shift 3s ease infinite;
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
+  color: var(--accent);
   font-weight: 600;
   user-select: none;
 }
@@ -316,23 +322,6 @@
 
 .files.closing {
   animation: slide-out-right 0.25s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
-}
-
-/* ---- 按钮交互反馈 ---- */
-@keyframes button-press {
-  0% {
-    transform: scale(1);
-  }
-  50% {
-    transform: scale(0.95);
-  }
-  100% {
-    transform: scale(1);
-  }
-}
-
-.icon-btn:active {
-  animation: button-press 0.15s ease-out;
 }
 
 /* ---- AI 对话区特效 ---- */
@@ -435,5 +424,25 @@
   }
   .term-error {
     color: #cf222e;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ---- 任务卡执行中进度轨 ---- */
+@keyframes rail-travel {
+  from {
+    top: 0;
+  }
+  to {
+    top: 60%;
   }
 }
