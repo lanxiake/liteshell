@@ -1,4 +1,4 @@
-import type { CpuCore, GpuInfo, MonitorSnapshot, NetCounter, NetIface, ProcInfo } from '../shared/types'
+import type { CpuCore, GpuInfo, MonitorSnapshot, NetCounter, NetIface, NpuInfo, ProcInfo } from '../shared/types'
 
 /**
  * Resource sampling for Linux hosts, in the spirit of what FinalShell scrapes:
@@ -44,6 +44,10 @@ export const MONITOR_SCRIPT = [
   'echo "os=$(. /etc/os-release 2>/dev/null && echo \\"$PRETTY_NAME\\")"',
   'echo "@@GPU"',
   'nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits 2>/dev/null',
+  'echo "@@NPU"',
+  // Ascend stack (npu-smi lives in /usr/local/sbin). Absent on almost every box;
+  // the `-i`-free form is one invocation (~0.6 s) carrying all cards.
+  'command -v npu-smi >/dev/null 2>&1 && npu-smi info 2>/dev/null',
   'echo "@@END"'
 ].join('\n')
 
@@ -62,6 +66,7 @@ const EMPTY = {
   netTotals: [],
   disk: [],
   gpu: [],
+  npu: [],
   proc: [],
   uptime: 0,
   info: { hostname: '', os: '', kernel: '', arch: '', cpuModel: '' }
@@ -114,6 +119,53 @@ function num(value: string | undefined): number {
 }
 
 /**
+ * `npu-smi info` prints one box table per card, two rows each:
+ *
+ *   | 2     910ProB             | OK            | 99.3        81                0    / 0             |
+ *   | 0                         | 0000:01:00.0  | 0           2370 / 15034      0    / 32768         |
+ *
+ * The card row carries id/model/health/power/temp, the chip row below it carries
+ * AI Core%, DDR and HBM. The card id is not the row number (this box has 2 and
+ * 5), so it is read off the table, not counted.
+ */
+function parseNpu(lines: string[]): NpuInfo[] {
+  const out: NpuInfo[] = []
+  let pending: NpuInfo | null = null
+  for (const line of lines) {
+    // Only the device table; the process table below it has its own layout.
+    if (/Process id/i.test(line)) break
+    if (pending) {
+      const chip = /^\|.*\|\s*([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.\d)\s*\|\s*([\d.]+)\s+(\d+)\s*\/\s*(\d+)\s+(\d+)\s*\/\s*(\d+)/i.exec(line)
+      if (chip) {
+        pending.util = num(chip[2])
+        pending.ddrUsed = num(chip[3]) * 1024 * 1024
+        pending.ddrTotal = num(chip[4]) * 1024 * 1024
+        pending.hbmUsed = num(chip[5]) * 1024 * 1024
+        pending.hbmTotal = num(chip[6]) * 1024 * 1024
+        out.push(pending)
+      }
+      pending = null
+      continue
+    }
+    const card = /^\|\s*(\d+)\s+(\S+)\s*\|\s*([A-Za-z]+)\s*\|\s*([\d.]+)\s+(\d+)\s+\d+\s*\/\s*\d+/.exec(line)
+    if (!card) continue
+    pending = {
+      id: Number(card[1]),
+      name: card[2],
+      health: card[3],
+      power: num(card[4]),
+      temp: num(card[5]),
+      util: 0,
+      ddrUsed: 0,
+      ddrTotal: 0,
+      hbmUsed: 0,
+      hbmTotal: 0
+    }
+  }
+  return out
+}
+
+/**
  * Used both ways: as a parser for the output of MONITOR_SCRIPT, and as the shape
  * the renderer keeps for rate maths. Pure — no ssh2, no Electron.
  */
@@ -129,6 +181,7 @@ export function parseMonitor(raw: string, at = Date.now()): MonitorSnapshot {
     netTotals: [],
     disk: [],
     gpu: [],
+    npu: [],
     proc: [],
     at
   }
@@ -230,6 +283,9 @@ export function parseMonitor(raw: string, at = Date.now()): MonitorSnapshot {
       temp: num(cols[4])
     } satisfies GpuInfo)
   }
+
+  /* --- NPU: same table shape, parsed field by field; empty without npu-smi --- */
+  snapshot.npu = parseNpu(sections.NPU ?? [])
 
   /* --- processes: `pid|user|cpu|mem|rss|read|write|comm|exe|args` ---
      `exe` is empty for another user's process without CAP_SYS_PTRACE, and the

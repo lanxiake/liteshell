@@ -58,6 +58,24 @@ cpu= Intel(R) Xeon(R) Platinum 8269CY CPU @ 2.50GHz
 os=Ubuntu 22.04.3 LTS
 @@GPU
 Tesla T4, 37, 1024, 15360, 45
+@@NPU
++------------------------------------------------------------------------------------------------+
+| npu-smi 25.5.2                   Version: 25.5.2                                               |
++---------------------------+---------------+----------------------------------------------------+
+| NPU   Name                | Health        | Power(W)    Temp(C)           Hugepages-Usage(page)|
+| Chip                      | Bus-Id        | AICore(%)   Memory-Usage(MB)  HBM-Usage(MB)        |
++===========================+===============+====================================================+
+| 2     910ProB             | OK            | 99.3        81                0    / 0             |
+| 0                         | 0000:01:00.0  | 37          2370 / 15034      100  / 32768         |
++===========================+===============+====================================================+
+| 5     910ProB             | Warning       | 88.1        74                0    / 0             |
+| 0                         | 0000:81:00.0  | 0           2364 / 15060      0    / 32741         |
++===========================+===============+====================================================+
++---------------------------+---------------+----------------------------------------------------+
+| NPU     Chip              | Process id    | Process name             | Process memory(MB)      |
++===========================+===============+====================================================+
+| No running processes found in NPU 2                                                            |
++===========================+===============+----------------------------------------------------+
 @@END`
 
 const bundle = join(work, 'monitor.mjs')
@@ -118,6 +136,19 @@ check('解析出一块 GPU', m.gpu.length === 1, `got ${m.gpu.length}`)
 check('GPU 利用率与温度', m.gpu[0].util === 37 && m.gpu[0].temp === 45, JSON.stringify(m.gpu[0]))
 check('显存 MiB 换算成字节', m.gpu[0].memTotal === 15360 * 1024 * 1024, `got ${m.gpu[0].memTotal}`)
 
+/* ---------------- npu ---------------- */
+check('解析出两张 NPU 卡', m.npu.length === 2, `got ${m.npu.length}`)
+check('卡号取表格里的 id，不是行号', m.npu.map((n) => n.id).join(',') === '2,5', m.npu.map((n) => n.id).join(','))
+check('型号、健康、功耗、温度', m.npu[0].name === '910ProB' && m.npu[0].health === 'OK' &&
+  near(m.npu[0].power, 99.3) && m.npu[0].temp === 81, JSON.stringify(m.npu[0]))
+check('AI Core 利用率来自 chip 行', m.npu[0].util === 37 && m.npu[1].util === 0, JSON.stringify(m.npu.map((n) => n.util)))
+check('DDR 已用/总量换算成字节', m.npu[0].ddrUsed === 2370 * 1024 * 1024 && m.npu[0].ddrTotal === 15034 * 1024 * 1024,
+  JSON.stringify(m.npu[0]))
+check('HBM 单独一池，不与 DDR 混算', m.npu[0].hbmUsed === 100 * 1024 * 1024 && m.npu[0].hbmTotal === 32768 * 1024 * 1024,
+  JSON.stringify(m.npu[0]))
+check('进程表没有被当成卡', m.npu.length === 2, `got ${m.npu.length}`)
+check('非 OK 的健康状态原样保留', m.npu[1].health === 'Warning', m.npu[1].health)
+
 /* ---------------- processes ---------------- */
 check('解析出两个进程', m.proc.length === 2, `got ${m.proc.length}`)
 check('PID 与 CPU', m.proc[0].pid === 1234 && near(m.proc[0].cpu, 45.2), JSON.stringify(m.proc[0]))
@@ -144,6 +175,7 @@ kernel=Linux 3.10.0
 @@GPU
 @@END`)
 check('没有 nvidia-smi 时 GPU 列表为空', bare.gpu.length === 0)
+check('没有 npu-smi 时 NPU 列表为空而不是 undefined', Array.isArray(bare.npu) && bare.npu.length === 0)
 check('没有 MemAvailable 时退回 MemFree', bare.memUsed === (1000000 - 200000) * 1024, `got ${bare.memUsed}`)
 check('没有 /proc/net/dev 时速率为 0', bare.netDown === 0 && bare.netUp === 0)
 check('没有进程列表时是空数组而不是 undefined', Array.isArray(bare.proc) && bare.proc.length === 0)

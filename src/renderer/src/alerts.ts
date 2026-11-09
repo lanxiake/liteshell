@@ -69,6 +69,16 @@ export function alertsFor(m: MonitorSnapshot): Alert[] {
     flag(toneOf(mem, 'gpuMem'), `${g.name} 显存 ${pct(mem)}`)
     flag(toneOf(g.temp, 'gpuTemp'), `${g.name} ${g.temp}°C`)
   }
+  // NPU: same temperature/memory thresholds as the GPU — the silicon differs,
+  // "80°C" and "HBM nearly full" do not.
+  for (const n of m.npu) {
+    const tag = `NPU ${n.id}`
+    if (n.health && n.health !== 'OK') out.push({ tone: 'danger', text: `${tag} ${n.health}` })
+    // HBM is what frameworks allocate from; DDR mostly sits at its baseline.
+    const mem = usePct(n.hbmUsed, n.hbmTotal)
+    flag(toneOf(mem, 'gpuMem'), `${tag} HBM ${pct(mem)}`)
+    flag(toneOf(n.temp, 'gpuTemp'), `${tag} ${n.temp}°C`)
+  }
 
   return out.sort((a, b) => RANK[a.tone] - RANK[b.tone])
 }

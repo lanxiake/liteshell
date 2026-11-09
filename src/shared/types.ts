@@ -216,6 +216,26 @@ export interface GpuInfo {
   temp: number
 }
 
+/** Ascend/NPU card, as `npu-smi` sees it. Kept apart from GpuInfo because the
+ *  numbers do not line up: `id` is the physical card number (2, 5 — not 0, 1),
+ *  and DDR/HBM are two separate pools instead of one "memory". */
+export interface NpuInfo {
+  /** The card id `npu-smi -i` takes. */
+  id: number
+  name: string
+  health: string
+  /** AI Core busy percentage, 0–100. */
+  util: number
+  temp: number
+  power: number
+  /** Card DDR (the 910B's "host-side" memory), bytes. */
+  ddrUsed: number
+  ddrTotal: number
+  /** HBM, the pool models actually get allocated from, bytes. */
+  hbmUsed: number
+  hbmTotal: number
+}
+
 export interface DiskInfo {
   fs: string
   mount: string
@@ -264,6 +284,8 @@ export interface MonitorSnapshot {
   latency?: NetLatency
   disk: DiskInfo[]
   gpu: GpuInfo[]
+  /** Ascend NPU cards; empty when npu-smi is absent. */
+  npu: NpuInfo[]
   /** The busiest few processes, for the panel's process table. */
   proc: ProcInfo[]
   uptime: number

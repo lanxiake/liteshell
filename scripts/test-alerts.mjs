@@ -43,6 +43,7 @@ const snap = (over = {}) => ({
   net: [],
   disk: [{ fs: '/dev/sda1', mount: '/', size: 40e9, used: 8e9 }],
   gpu: [],
+  npu: [],
   uptime: 100,
   info: { hostname: 'h', os: 'o', kernel: 'k', arch: 'x86_64', cpuModel: 'c' },
   ...over
@@ -80,6 +81,22 @@ check('GPU 正常就不出现', alertsFor(snap({ gpu: [{ name: 'T4', util: 5, me
 check('负载按核心数折算，不是绝对数', alertsFor(snap({ load: [4, 4, 4] })).length === 0, texts({ load: [4, 4, 4] }).join('|'))
 check('每核负载超 1.5 会报', texts({ load: [14, 14, 14] })[0] === 'warn:负载 14.00（8 核）', texts({ load: [14, 14, 14] }).join('|'))
 check('每核负载超 2.5 是 danger', tones({ load: [24, 24, 24] })[0] === 'danger')
+
+/* ---------------- npu ---------------- */
+const npu = (over = {}) => ({
+  id: 2, name: '910ProB', health: 'OK', util: 0, temp: 60, power: 90,
+  ddrUsed: 2e9, ddrTotal: 16e9, hbmUsed: 0, hbmTotal: 32e9, ...over
+})
+check('NPU 正常就不出现', alertsFor(snap({ npu: [npu()] })).length === 0, texts({ npu: [npu()] }).join('|'))
+check('NPU HBM 紧张会报', texts({ npu: [npu({ hbmUsed: 30e9 })] })[0] === 'warn:NPU 2 HBM 94%',
+  texts({ npu: [npu({ hbmUsed: 30e9 })] }).join('|'))
+check('NPU 温度高会报', texts({ npu: [npu({ temp: 82 })] })[0] === 'warn:NPU 2 82°C',
+  texts({ npu: [npu({ temp: 82 })] }).join('|'))
+check('NPU 健康异常直接 danger', tones({ npu: [npu({ health: 'Warning' })] })[0] === 'danger',
+  texts({ npu: [npu({ health: 'Warning' })] }).join('|'))
+// DDR 基线占用很高是常态，不该按内存阈值报警。
+check('DDR 占用不参与预警', alertsFor(snap({ npu: [npu({ ddrUsed: 15e9 })] })).length === 0,
+  texts({ npu: [npu({ ddrUsed: 15e9 })] }).join('|'))
 
 /* ---------------- ordering ---------------- */
 const many = alertsFor(snap({ cpu: 99, memUsed: 16e9 * 0.9, disk: [{ fs: 'x', mount: '/data', size: 100e9, used: 86e9 }] }))

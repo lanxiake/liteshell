@@ -369,6 +369,85 @@ function uid(): string {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4)
 }
 
+/* ------------------------------------------------------------------ *
+ * feedback
+ * ------------------------------------------------------------------ */
+
+/**
+ * One place every action answers back through — a toast for "done", the same
+ * toast in red for "didn't work". Errors used to land only in the log panel,
+ * which nobody opens to find out whether the click they just made worked.
+ */
+type ToastTone = 'ok' | 'warn' | 'error'
+
+const TOAST_MS = 2600
+let toastBox: HTMLElement | null = null
+let toastTimer = 0
+
+function toast(text: string, tone: ToastTone = 'ok'): void {
+  if (!toastBox) {
+    toastBox = el('div', 'toast-box')
+    document.body.appendChild(toastBox)
+  }
+  const box = toastBox
+  box.replaceChildren()
+  box.hidden = false
+  box.append(el('div', `toast tone-${tone}`, text))
+  window.clearTimeout(toastTimer)
+  // A failure is worth reading twice as long as a confirmation.
+  toastTimer = window.setTimeout(() => {
+    box.hidden = true
+  }, tone === 'error' ? TOAST_MS * 2 : TOAST_MS)
+  if (tone !== 'ok') log(tone === 'error' ? 'error' : 'warn', text)
+}
+
+/** The success counterpart of a caught error: message on screen, line in the log. */
+function done(text: string): void {
+  toast(text)
+  log('info', text)
+}
+
+/**
+ * Runs an async action behind a button and reports back. The button goes
+ * disabled and says so while it runs, which is the other half of the feedback
+ * — a slow SFTP call looks identical to a click that never registered.
+ */
+async function runAction(
+  btn: HTMLElement | null,
+  fn: () => Promise<void> | void,
+  what: string
+): Promise<void> {
+  if (btn && (btn as HTMLButtonElement).disabled) return
+  const result = fn()
+  // Only a real wait gets the busy label; a click that finishes in the same
+  // frame should not blink "复制中…" before saying it is done.
+  if (!(result instanceof Promise)) {
+    try {
+      await result
+    } catch (err) {
+      toast(`${what}失败：${(err as Error).message}`, 'error')
+    }
+    return
+  }
+  const label = btn?.textContent ?? ''
+  if (btn) {
+    ;(btn as HTMLButtonElement).disabled = true
+    btn.classList.add('busy')
+    btn.textContent = `${label}中…`
+  }
+  try {
+    await result
+  } catch (err) {
+    toast(`${what}失败：${(err as Error).message}`, 'error')
+  } finally {
+    if (btn) {
+      ;(btn as HTMLButtonElement).disabled = false
+      btn.classList.remove('busy')
+      btn.textContent = label
+    }
+  }
+}
+
 /** The X on every side panel. The toolbar button that opened a panel sits at
  *  the far left, so closing it from the panel itself is the short way out. */
 function panelClose(title: string, run: () => void): HTMLElement {
@@ -874,6 +953,7 @@ async function moveInto(id: string, folderId: string | null): Promise<void> {
     await api.saveFolder({ ...folder, parentId: folderId })
   }
   await refreshStore()
+  toast('已移动')
 }
 
 /** The tree's own menu: right-click anywhere that is not a node. */
@@ -908,7 +988,7 @@ function treeMenu(ev: MouseEvent, item: Folder | Connection, isFolder: boolean, 
         { label: '复制 IP', run: () => copyText((item as Connection).host, 'IP') },
         { label: '配置本机免密登录…', run: () => void passwordlessDialog(item as Connection) },
         { label: '导出…', run: () => void exportOneDialog(item as Connection) },
-        { label: '复制', run: () => void api.duplicateConnection(id).then(refreshStore) },
+        { label: '复制连接', run: () => void api.duplicateConnection(id).then(() => { toast('连接已复制'); return refreshStore() }) },
         { sep: true },
         { label: '删除', danger: true, run: () => confirmDelete('连接', `删除连接「${item.name}」？`, () => api.deleteConnection(id)) }
       ]
@@ -924,6 +1004,7 @@ function renameConnection(conn: Connection): void {
     const { hasSecret: _hasSecret, secret: _secret, ...rest } = conn
     await api.saveConnection({ ...rest, name }, null)
     await refreshStore()
+    toast(`已重命名为「${name}」`)
   })
 }
 
@@ -953,6 +1034,8 @@ async function passwordlessDialog(conn: Connection): Promise<void> {
       el('div', 'mon-sub', '私钥没有口令，请像密码一样保管它。')
     )
     showModal('免密登录已配置', body, [
+      // Stay open: the user may want to read the paths before closing, and the
+      // toast answers the click either way.
       { label: '复制命令', onClick: () => copyText(`ssh ${r.alias}`, '命令') },
       { label: '好', primary: true, onClick: closeModal }
     ])
@@ -1094,6 +1177,7 @@ async function desktopDialog(conn: Connection): Promise<void> {
             `[${conn.name}] 内嵌远程桌面已打开：远端 127.0.0.1:${form.rdpPort}（${form.rdpUsername}）`
           )
           $('#status-text').textContent = `内嵌远程桌面：${conn.name}`
+          toast(`远程桌面窗口已打开：${conn.name}`)
         } catch (err) {
           failed((err as Error).message)
         }
@@ -1119,8 +1203,9 @@ async function exportOneDialog(conn: Connection): Promise<void> {
     showModal('导出完成', el('div', 'mon-sub', report.path), [
       { label: '好', primary: true, onClick: closeModal }
     ])
+    toast(`已导出「${conn.name}」 → ${report.path}`)
   } catch (err) {
-    log('error', `导出失败：${(err as Error).message}`)
+    toast(`导出失败：${(err as Error).message}`, 'error')
   }
 }
 
@@ -1166,7 +1251,10 @@ async function exportFolderDialog(folder: Folder): Promise<void> {
 
 function confirmDelete(_kind: string, message: string, run: () => Promise<void>): void {
   if (!window.confirm(message)) return
-  void run().then(refreshStore)
+  void run().then(() => {
+    toast('已删除')
+    return refreshStore()
+  }).catch((err: Error) => toast(`删除失败：${err.message}`, 'error'))
 }
 
 /* ------------------------------------------------------------------ *
@@ -1228,7 +1316,7 @@ function showModal(
   const footer = el('footer')
   for (const action of actions) {
     const btn = el('button', `btn${action.primary ? ' primary' : ''}${action.danger ? ' danger' : ''}`, action.label)
-    btn.addEventListener('click', () => void action.onClick())
+    btn.addEventListener('click', () => void runAction(btn, action.onClick, action.label))
     footer.appendChild(btn)
   }
   modal.appendChild(footer)
@@ -1261,7 +1349,11 @@ function promptDialog(
       primary: true,
       onClick: async () => {
         const text = value.value.trim()
-        if (!text) return
+        if (!text) {
+          toast('不能留空', 'warn')
+          value.focus()
+          return
+        }
         closeModal()
         await onOk(text)
       }
@@ -1418,6 +1510,7 @@ function connDialog(existing: Connection | null, folderId: string | null): void 
     // The one just imported is almost certainly the one you meant.
     keyValue = added[added.length - 1].path
     fillKeys()
+    toast(`已导入并选用私钥 ${added[added.length - 1].name}`)
   })
   const keyBrowse = el('button', 'btn', '浏览')
   keyBrowse.title = '选一个不在私钥库里的文件'
@@ -1426,6 +1519,7 @@ function connDialog(existing: Connection | null, folderId: string | null): void 
     if (!picked) return
     keyValue = picked
     fillKeys()
+    toast(`已选用私钥文件 ${picked}`)
   })
 
   const keyRow = el('div', 'row-inline')
@@ -1477,7 +1571,11 @@ function connDialog(existing: Connection | null, folderId: string | null): void 
       label: '保存',
       primary: true,
       onClick: async () => {
-        if (!host.value.trim()) return
+        if (!host.value.trim()) {
+          toast('主机不能为空', 'warn')
+          host.focus()
+          return
+        }
         const next: Connection = {
           ...draft,
           name: name.value.trim() || `${username.value}@${host.value}`,
@@ -1496,6 +1594,7 @@ function connDialog(existing: Connection | null, folderId: string | null): void 
         await api.saveConnection(next, existing && secret.value === '' ? null : secret.value)
         closeModal()
         await refreshStore()
+        done(existing ? `已保存「${next.name}」` : `已新建「${next.name}」`)
       }
     }
   ])
@@ -1519,10 +1618,15 @@ function folderDialog(existing: Folder | null, parentId: string | null): void {
       primary: true,
       onClick: async () => {
         const label = name.value.trim()
-        if (!label) return
+        if (!label) {
+          toast('名称不能为空', 'warn')
+          name.focus()
+          return
+        }
         await api.saveFolder({ id: existing?.id ?? uid(), name: label, parentId: parent.value || null })
         closeModal()
         await refreshStore()
+        done(`已保存文件夹「${label}」`)
       }
     }
   ])
@@ -1600,6 +1704,7 @@ function settingsDialog(): void {
       bgPath = picked.path
       bgName.textContent = baseName(bgPath)
       bgName.title = bgPath
+      toast(`背景图已换成 ${baseName(bgPath)}`)
       // Shown at once, so the choice is judged against the real thing rather
       // than a file name. Cancel puts the old one back (in the footer below).
       bgDataUrl = picked.data
@@ -1612,6 +1717,7 @@ function settingsDialog(): void {
     bgName.title = ''
     bgDataUrl = null
     applySettings({ ...store.settings, backgroundImage: '' })
+    toast('背景图已清除')
   })
   bgRow.append(bgPick, bgName, bgClear)
 
@@ -1790,10 +1896,12 @@ function settingsDialog(): void {
       })
       .then((reply) => {
         note.textContent = `✓ 连接正常。模型回了：${reply.slice(0, 120)}`
+        toast('模型连接正常')
       })
       .catch((err) => {
         // Verbatim, not summarised: the whole point of the test is the reason.
         note.textContent = `✗ ${short(err)}`
+        toast(`模型连接失败：${short(err)}`, 'error')
       })
       .finally(() => {
         test.disabled = false
@@ -1834,7 +1942,8 @@ function settingsDialog(): void {
       void api.exportSkill().then((dir) => {
         if (!dir) return
         note2.textContent = `已导出到 ${dir}`
-      })
+        toast(`技能包已导出到 ${dir}`)
+      }).catch((err: Error) => toast(`导出失败：${err.message}`, 'error'))
     })
     skillRow.append(btn, note2)
   }
@@ -1931,6 +2040,7 @@ function settingsDialog(): void {
         // refreshStore resyncs that on every session.
         await refreshStore()
         closeModal()
+        done('设置已保存')
       }
     }
   ])
@@ -1963,7 +2073,7 @@ async function updateDialog(): Promise<void> {
     hint.textContent = `${human(received)} / ${total ? human(total) : '?'}（${pct}%）`
   })
   showModal('检查更新', body, [
-    { label: '打开发布页', onClick: () => void api.updateReleasesUrl() },
+    { label: '打开发布页', onClick: () => void api.updateReleasesUrl().then(() => toast('已在浏览器打开发布页')) },
     { label: '关闭', primary: true, onClick: closeModal }
   ])
 
@@ -1971,10 +2081,12 @@ async function updateDialog(): Promise<void> {
   if (result.kind === 'error') {
     status.textContent = `检查失败：${result.message}`
     status.classList.add('tone-danger')
+    toast(`检查更新失败：${result.message}`, 'error')
     return
   }
   if (result.kind === 'latest') {
     status.textContent = `已经是最新版本（${result.current}）。`
+    toast(`已经是最新版本（${result.current}）`)
     return
   }
 
@@ -2025,11 +2137,13 @@ async function updateDialog(): Promise<void> {
         download.textContent = '安装并退出'
         download.classList.remove('primary')
         download.classList.add('danger')
+        toast('下载完成，校验通过')
       })
       .catch((err) => {
         download.disabled = false
         hint!.textContent = `下载失败：${(err as Error).message}`
         hint!.classList.add('tone-danger')
+        toast(`下载失败：${(err as Error).message}`, 'error')
       })
   })
 }
@@ -2115,12 +2229,10 @@ async function exportBundleDialog(): Promise<void> {
 
     const report = await api.exportConnections(passphrase)
     if (!report) return
-    log(
-      'info',
-      `已导出 ${report.connections} 条连接和 ${report.keys} 个私钥` +
+    toast(`已导出 ${report.connections} 条连接 → ${report.path}`)
+    log('info', `已导出 ${report.connections} 条连接和 ${report.keys} 个私钥` +
         (report.passwords ? `，以及 ${report.passwords} 个密码` : '') +
-        ` → ${report.path}`
-    )
+        ` → ${report.path}`)
     const body = el('div')
     body.style.display = 'grid'
     body.style.gap = '6px'
@@ -2210,6 +2322,7 @@ async function importBundleDialog(): Promise<void> {
       body.append(el('div', 'mon-sub', `⚠ ${report.missingKeys} 条连接引用的私钥不在备份里`))
     }
     showModal('导入完成', body, [{ label: '好', primary: true, onClick: closeModal }])
+    toast(`已导入 ${report.connections} 条连接、${report.keys} 个私钥`)
   } catch (err) {
     log('error', `导入失败：${(err as Error).message}`)
     showModal('导入失败', el('div', '', (err as Error).message), [
@@ -2261,6 +2374,7 @@ async function importFinalshellDialog(folderId: string | null = null, singleFile
   }
 
   showModal('导入完成', body, [{ label: '好', primary: true, onClick: closeModal }])
+  toast(`已导入 ${summary.folders} 个文件夹、${summary.connections} 条连接`)
 }
 
 /* ------------------------------------------------------------------ *
@@ -2325,8 +2439,11 @@ async function keysDialog(): Promise<void> {
       label: '导入私钥',
       onClick: async () => {
         const added = await importKeyFiles()
-        if (!added?.length) return
-        log('info', `导入私钥：${added.map((k) => k.name).join('、')}`)
+        if (!added?.length) {
+          toast('没有选择私钥文件', 'warn')
+          return
+        }
+        done(`已导入 ${added.length} 个私钥：${added.map((k) => k.name).join('、')}`)
         await keysDialog()
       }
     },
@@ -2358,6 +2475,7 @@ function keyEditDialog(key: KeyFile): void {
         if (passphrase === null) return
         await api.setKeySecret(key.id, passphrase)
         await refreshStore()
+        done(passphrase ? `${key.name} 的口令已保存` : `${key.name} 的口令已清除`)
         await keysDialog()
       }
     },
@@ -2365,7 +2483,8 @@ function keyEditDialog(key: KeyFile): void {
       label: '导出到文件',
       onClick: async () => {
         const saved = await api.exportKey(key.id)
-        if (saved) log('info', `已导出私钥到 ${saved}`)
+        if (saved) toast(`已导出到 ${saved}`)
+        else toast('导出已取消', 'warn')
       }
     },
     {
@@ -2375,9 +2494,12 @@ function keyEditDialog(key: KeyFile): void {
         const used = store.connections.some((c) => c.privateKeyPath === key.path)
         const note = used ? `\n仍有连接在用它，文件会保留，只从列表里移除。` : ''
         if (!window.confirm(`从私钥库移除「${key.name}」？${note}`)) return
-        await api.deleteKey(key.id)
-        await refreshStore()
-        await keysDialog()
+        await runAction(null, async () => {
+          await api.deleteKey(key.id)
+          await refreshStore()
+          toast(`已移除私钥「${key.name}」`)
+          await keysDialog()
+        }, '删除私钥')
       }
     },
     { label: '取消', onClick: () => void keysDialog() },
@@ -2391,6 +2513,7 @@ function keyEditDialog(key: KeyFile): void {
           comment: comment.value.trim() || undefined
         })
         await refreshStore()
+        done('私钥信息已保存')
         await keysDialog()
       }
     }
@@ -2450,6 +2573,7 @@ function quickDialog(): void {
         await api.saveQuickCommands(store.quickCommands)
         for (const s of sessions.values()) renderQuickBar(s)
         closeModal()
+        done('快捷命令已保存')
       }
     }
   ])
@@ -2501,7 +2625,7 @@ function useCommand(cmd: string): void {
     session.term.focus()
     return
   }
-  void navigator.clipboard.writeText(cmd)
+  copyText(cmd, '命令')
   $('#status-text').textContent = '没有已连接的会话，命令已复制到剪贴板'
 }
 
@@ -2933,12 +3057,14 @@ function buildTab(session: Session, pane: HTMLElement): void {
     if ((ev.target as HTMLElement).closest('.files-list')) return
     ev.preventDefault()
     // Whatever the user dragged over — a log line, a monitor figure — is one
-    // click away from the clipboard instead of a Ctrl+C that the terminal eats.
+    // click away from the clipboard. Drop the selection afterwards so a
+    // second right-click does not offer the same text again.
     const picked = window.getSelection()?.toString().trim() ?? ''
+    if (picked) window.getSelection()?.removeAllRanges()
     showMenu(ev.clientX, ev.clientY, [
       ...(picked
         ? [
-            { label: '复制选中内容', run: () => void navigator.clipboard.writeText(picked) },
+            { label: '复制选中内容', run: () => copyText(picked, '选中内容') },
             { sep: true }
           ]
         : []),
@@ -3100,7 +3226,13 @@ function handleTermKey(session: Session, ev: KeyboardEvent): boolean {
   }
 
   if (ev.ctrlKey && ev.shiftKey && ev.code === 'KeyC') {
-    if (session.term.hasSelection()) void navigator.clipboard.writeText(session.term.getSelection())
+    if (session.term.hasSelection()) copyText(session.term.getSelection(), '选中内容')
+    return false
+  }
+  // Plain Ctrl+C copies a selection and is the shell's interrupt otherwise —
+  // with nothing selected it must pass through, or Ctrl+C stops interrupting.
+  if (ev.ctrlKey && !ev.shiftKey && !ev.altKey && ev.code === 'KeyC' && session.term.hasSelection()) {
+    copyText(session.term.getSelection(), '选中内容')
     return false
   }
   if (ev.ctrlKey && ev.shiftKey && ev.code === 'KeyV') {
@@ -3294,6 +3426,7 @@ function handleEvent(ev: SessionEvent): void {
   setStatus(session, ev.status)
   if (ev.status === 'ready') {
     log('info', `[${session.name}] 已连接`)
+    toast(`已连接 ${session.name}`)
     settleSecret(ev.sessionId, session.name)
     // Keep a first-connection host key notice up so the fingerprint is actually readable.
     if (!session.notice.dataset.hostkey) session.notice.hidden = true
@@ -3302,12 +3435,14 @@ function handleEvent(ev: SessionEvent): void {
     if (activeId === session.id) openMonitor(session)
   } else if (ev.status === 'error') {
     log('error', `[${session.name}] 连接失败：${ev.error ?? '未知错误'}`)
+    toast(`${session.name} 连接失败：${ev.error ?? '未知错误'}`, 'error')
     session.notice.hidden = false
     session.notice.classList.add('error')
     session.notice.textContent = `连接失败：${ev.error ?? '未知错误'}`
   } else if (ev.status === 'closed') {
     if (prevStatus === 'error') return
     log('info', `[${session.name}] 会话已断开`)
+    toast(`${session.name} 会话已断开`, 'warn')
     session.notice.hidden = false
     session.notice.classList.remove('error')
     session.notice.textContent = '会话已断开'
@@ -3536,6 +3671,7 @@ function historyDialog(session: Session): void {
         session.history = []
         void api.saveHistory(session.connectionId, [])
         closeModal()
+        toast('历史命令已清空')
       }
     },
     { label: '关闭', primary: true, onClick: closeModal }
@@ -3796,7 +3932,10 @@ function startPathEdit(session: Session, pathbar: HTMLElement, crumbs: HTMLEleme
 }
 
 function copyText(text: string, what: string): void {
-  void navigator.clipboard.writeText(text)
+  void navigator.clipboard.writeText(text).then(
+    () => toast(`已复制${what}`),
+    (err: Error) => toast(`复制失败：${err.message}`, 'error')
+  )
   $('#status-text').textContent = `已复制${what} ${text}`
 }
 
@@ -3816,9 +3955,13 @@ async function openEntry(session: Session, entry: SftpEntry): Promise<void> {
 async function openWithSystem(session: Session, entry: SftpEntry): Promise<void> {
   $('#status-text').textContent = `正在取回 ${entry.name}…`
   try {
-    $('#status-text').textContent = await api.sftpOpen(session.id, entry.path)
+    const msg = await api.sftpOpen(session.id, entry.path)
+    $('#status-text').textContent = msg
+    // sftpOpen hands the file to the OS file manager; it says so in its reply.
+    toast(msg)
   } catch (err) {
     $('#status-text').textContent = `打开失败：${(err as Error).message}`
+    toast(`打开 ${entry.name} 失败：${(err as Error).message}`, 'error')
   }
 }
 
@@ -3827,15 +3970,18 @@ async function uploadHere(session: Session): Promise<void> {
 }
 
 async function uploadTo(session: Session, remoteDir: string): Promise<void> {
-  await api.sftpUpload(session.id, remoteDir)
+  // Opens the OS picker first; no pick is a cancel, not a failure.
+  const uploaded = await api.sftpUpload(session.id, remoteDir)
   await navigate(session, session.filePath)
+  if (uploaded.length) done(`已上传 ${uploaded.length} 个文件到 ${remoteDir}`)
+  else toast('没有选择文件', 'warn')
 }
 
 /** One path segment, never a path: typing `a/b` would silently make folders. */
 function segment(value: string): string | null {
   const name = value.trim()
   if (!name || name === '.' || name === '..' || name.includes('/')) {
-    log('warn', '名称不能为空，也不能包含 /')
+    toast('名称不能为空，也不能包含 /', 'warn')
     return null
   }
   return name
@@ -3847,6 +3993,7 @@ async function mkdirHere(session: Session): Promise<void> {
     if (!name) return
     await api.sftpMkdir(session.id, `${session.filePath.replace(/\/$/, '')}/${name}`)
     await navigate(session, session.filePath)
+    done(`已创建文件夹 ${name}`)
   })
 }
 
@@ -3856,6 +4003,7 @@ async function newFileHere(session: Session): Promise<void> {
     if (!name) return
     await api.sftpTouch(session.id, `${session.filePath.replace(/\/$/, '')}/${name}`)
     await navigate(session, session.filePath)
+    done(`已创建文件 ${name}`)
   })
 }
 
@@ -3864,27 +4012,41 @@ function chmodEntry(session: Session, entry: SftpEntry): void {
   promptDialog(`权限 — ${entry.name}`, '八进制权限（如 644、755、4755）', current, async (value) => {
     const text = value.trim()
     if (!/^[0-7]{3,4}$/.test(text)) {
-      log('warn', `权限要写成 644 这样的八进制，收到的是「${text}」`)
+      toast(`权限要写成 644 这样的八进制，收到的是「${text}」`, 'warn')
       return
     }
     await api.sftpChmod(session.id, entry.path, parseInt(text, 8))
     await navigate(session, session.filePath)
+    done(`${entry.name} 权限改为 ${text}`)
   })
 }
 
 async function downloadEntry(session: Session, entry: SftpEntry): Promise<void> {
+  $('#status-text').textContent = `正在下载 ${entry.name}…`
   const saved = await api.sftpDownload(session.id, entry.path, entry.isDir)
-  if (saved) $('#status-text').textContent = `已下载到 ${saved}`
+  if (saved) {
+    $('#status-text').textContent = `已下载到 ${saved}`
+    toast(`已下载到 ${saved}`)
+  } else {
+    $('#status-text').textContent = '下载已取消'
+    toast('下载已取消', 'warn')
+  }
 }
 
 async function downloadArchive(session: Session, entry: SftpEntry): Promise<void> {
   $('#status-text').textContent = `正在服务器上打包 ${entry.name}…`
   try {
     const saved = await api.sftpDownloadArchive(session.id, entry.path)
-    if (saved) $('#status-text').textContent = `已打包下载到 ${saved}`
+    if (saved) {
+      $('#status-text').textContent = `已打包下载到 ${saved}`
+      toast(`已打包下载到 ${saved}`)
+    } else {
+      $('#status-text').textContent = '打包下载已取消'
+      toast('打包下载已取消', 'warn')
+    }
   } catch (err) {
     $('#status-text').textContent = `打包下载失败：${(err as Error).message}`
-    log('error', `[${session.name}] 打包下载 ${entry.path} 失败：${(err as Error).message}`)
+    toast(`打包下载 ${entry.name} 失败：${(err as Error).message}`, 'error')
   }
 }
 
@@ -3894,6 +4056,7 @@ async function renameEntry(session: Session, entry: SftpEntry): Promise<void> {
     if (!name || name === entry.name) return
     await api.sftpRename(session.id, entry.path, `${session.filePath.replace(/\/$/, '')}/${name}`)
     await navigate(session, session.filePath)
+    done(`已重命名为 ${name}`)
   })
 }
 
@@ -3907,8 +4070,9 @@ async function deleteEntry(
   try {
     await api.sftpRemove(session.id, entry.path, entry.isDir, recursive)
     await navigate(session, session.filePath)
+    done(`已删除 ${entry.name}`)
   } catch (err) {
-    log('error', `[${session.name}] 删除 ${entry.path} 失败：${(err as Error).message}`)
+    toast(`删除 ${entry.name} 失败：${(err as Error).message}`, 'error')
   }
 }
 
@@ -3943,7 +4107,7 @@ async function openEntryInEditor(session: Session, entry: SftpEntry): Promise<vo
     file = await api.sftpReadText(session.id, entry.path)
   } catch (err) {
     $('#status-text').textContent = `读取失败：${(err as Error).message}`
-    log('error', `[${session.name}] 读取 ${entry.path} 失败：${(err as Error).message}`)
+    toast(`读取 ${entry.path} 失败：${(err as Error).message}`, 'error')
     return
   }
 
@@ -3953,12 +4117,15 @@ async function openEntryInEditor(session: Session, entry: SftpEntry): Promise<vo
       $('#status-text').textContent = `已跳过 ${entry.name}（${file.reason}）`
       return
     }
-    $('#status-text').textContent = await api.sftpOpen(session.id, entry.path)
+    const msg = await api.sftpOpen(session.id, entry.path)
+    $('#status-text').textContent = msg
+    toast(msg)
     return
   }
 
   buildEditor(session, entry, file)
   $('#status-text').textContent = `已打开 ${entry.path}`
+  toast(`正在编辑 ${entry.name}`)
 }
 
 function buildEditor(
@@ -3999,7 +4166,7 @@ function buildEditor(
   refreshEditorState()
   area.focus()
 
-  saveBtn.addEventListener('click', () => void saveEditor())
+  saveBtn.addEventListener('click', () => void runAction(saveBtn, saveEditor, '保存'))
   closeBtn.addEventListener('click', () => editorClose())
   area.addEventListener('input', refreshEditorState)
   area.addEventListener('keydown', (ev) => {
@@ -4059,12 +4226,14 @@ async function saveEditor(): Promise<void> {
       const go = window.confirm(`${doc.name} 在服务器上已被改动（可能是别人改的，也可能是日志在写）。\n\n用本地这份覆盖它？`)
       if (!go) {
         refreshEditorState()
+        toast('覆盖已取消，服务器上的版本没有动', 'warn')
         return
       }
       res = await api.sftpWriteText(doc.session.id, doc.path, text, doc.mtime, true)
     }
     if (!res.ok) {
       refreshEditorState()
+      toast('服务器拒绝了这次写入，文件没有保存', 'error')
       return
     }
     doc.mtime = res.mtime
@@ -4072,13 +4241,14 @@ async function saveEditor(): Promise<void> {
     log('info', `[${doc.session.name}] 已保存 ${doc.path}`)
     refreshEditorState()
     doc.state.textContent = `已保存 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`
+    toast(`已保存 ${doc.path}`)
     // The listing shows size and mtime, so put it back in sync.
     void navigate(doc.session, doc.session.filePath)
   } catch (err) {
     const message = (err as Error).message
     doc.state.textContent = `保存失败：${message}`
     doc.state.classList.add('dirty')
-    log('error', `[${doc.session.name}] 保存 ${doc.path} 失败：${message}`)
+    toast(`保存 ${doc.path} 失败：${message}`, 'error')
   }
 }
 
@@ -4131,6 +4301,7 @@ function buildTransferHeader(session: Session): HTMLElement {
     session.transferList.querySelectorAll('.xfer').forEach((n) => n.remove())
     bar.querySelector('.xfer-count')!.textContent = '0 项'
     session.transferList.style.display = 'none'
+    toast('已清除完成记录')
   })
   bar.append(clear)
   return bar
@@ -4140,12 +4311,13 @@ function buildTransferHeader(session: Session): HTMLElement {
 async function uploadDropped(session: Session, files: FileList, remoteDir: string): Promise<void> {
   const paths = [...files].map((f) => api.pathForFile(f)).filter(Boolean)
   if (!paths.length) return
-  log('info', `[${session.name}] 上传 ${paths.length} 个文件到 ${remoteDir}`)
+  toast(`正在上传 ${paths.length} 个文件到 ${remoteDir}…`)
   try {
     await api.sftpUploadPaths(session.id, paths, remoteDir)
     await navigate(session, session.filePath)
+    done(`已上传 ${paths.length} 个文件到 ${remoteDir}`)
   } catch (err) {
-    log('error', `[${session.name}] 上传失败：${(err as Error).message}`)
+    toast(`上传失败：${(err as Error).message}`, 'error')
   }
 }
 
@@ -4230,6 +4402,7 @@ interface MonitorView {
   /** One row per interface, kept across polls so its sparkline accumulates. */
   netRows: Map<string, { name: HTMLElement; spark: HTMLCanvasElement; hist: number[]; rate: HTMLElement; total: HTMLElement }>
   gpu: HTMLElement
+  npu: HTMLElement
   disk: HTMLElement
   proc: HTMLElement
   info: HTMLElement
@@ -4329,6 +4502,7 @@ function buildMonitor(): MonitorView {
   // can see which process is generating that traffic. Every titled block folds;
   // all of them start open, so nothing moves for someone who never clicked one.
   const gpu = section('GPU')
+  const npu = section('NPU')
   const disk = section('磁盘')
   const procList = section('进程')
   const netList = section('网络')
@@ -4344,6 +4518,7 @@ function buildMonitor(): MonitorView {
     netBox: netList,
     netRows: new Map(),
     gpu,
+    npu,
     disk,
     proc: procList,
     info,
@@ -4483,6 +4658,52 @@ function renderMonitor(view: MonitorView, m: MonitorSnapshot): void {
     row.append(el('span', `mon-val tone-${tone}`, `${memPct.toFixed(0)}%  ${human(g.memUsed)} / ${human(g.memTotal)}`))
     card.append(row)
     view.gpu.append(card)
+  }
+
+  view.npu.replaceChildren()
+  if (!m.npu.length) {
+    view.npu.append(el('div', 'mon-empty', '没有检测到昇腾 NPU（需要 npu-smi）'))
+  }
+  for (const n of m.npu) {
+    const card = el('div', 'gpu-card')
+    const head = el('div', 'mon-row-head')
+    // The card id is what `npu-smi -i` takes, and cards are numbered unevenly
+    // (this box has 2 and 5 on one 8-card board) — so show the id, not a counter.
+    head.append(el('span', 'gpu-idx', `#${n.id}`))
+    const name = el('span', 'mon-name', n.name)
+    name.title = n.name
+    head.append(name)
+    if (n.health && n.health !== 'OK') head.append(el('span', 'badge tone-danger', n.health))
+    head.append(el('span', `badge tone-${toneOf(n.temp, 'gpuTemp')}`, `${n.temp}°C`))
+    head.append(el('span', 'mon-sub', `${n.power.toFixed(0)} W`))
+    card.append(head)
+
+    // AI Core is the thing inference actually waits on; show it when busy.
+    if (n.util > 0) {
+      const utilTone = n.util >= 90 ? 'warn' : 'ok'
+      const urow = el('div', 'gpu-row')
+      urow.append(el('span', 'gpu-label', 'AI Core'))
+      urow.append(bar(n.util, utilTone))
+      urow.append(el('span', `mon-val tone-${utilTone}`, `${n.util.toFixed(0)}%`))
+      card.append(urow)
+    }
+
+    // HBM is the pool frameworks allocate from; on an idle card it reads 0 while
+    // DDR holds the resident processes' memory, so both are worth a line.
+    for (const [label, used, total] of [
+      ['HBM', n.hbmUsed, n.hbmTotal],
+      ['DDR', n.ddrUsed, n.ddrTotal]
+    ] as const) {
+      if (!total) continue
+      const pct = usePct(used, total)
+      const tone = toneOf(pct, 'gpuMem')
+      const row = el('div', 'gpu-row')
+      row.append(el('span', 'gpu-label', label))
+      row.append(bar(pct, tone))
+      row.append(el('span', `mon-val tone-${tone}`, `${pct.toFixed(0)}%  ${human(used)} / ${human(total)}`))
+      card.append(row)
+    }
+    view.npu.append(card)
   }
 
   view.disk.replaceChildren()
@@ -5399,6 +5620,7 @@ async function agentHistoryView(id: string, target?: ResumeTarget | null): Promi
       danger: true,
       onClick: async (): Promise<void> => {
         await api.agentHistoryDelete(convo.id)
+        toast('对话已删除')
         closeModal()
       }
     },
@@ -5407,6 +5629,8 @@ async function agentHistoryView(id: string, target?: ResumeTarget | null): Promi
       onClick: async (): Promise<void> => {
         const path = await api.agentHistoryExport(convo.id)
         if (path) log('info', `AI 对话已导出 → ${path}`)
+        if (path) toast(`已导出到 ${path}`)
+        else toast('导出已取消', 'warn')
         closeModal()
       }
     },
@@ -5605,6 +5829,7 @@ function themeDialog(): void {
     applySettings(store.settings)
     mark(key)
     log('info', `主题切换为 ${THEMES[key].label}`)
+    toast(`主题已切换为 ${THEMES[key].label}`)
   }
 }
 
@@ -5647,7 +5872,13 @@ function logDialog(): void {
   showModal('日志', box, [
     {
       label: '复制',
-      onClick: () => void navigator.clipboard.writeText(logText())
+      onClick: () => {
+        if (!logLines.length) {
+          toast('日志是空的，没有可复制的内容', 'warn')
+          return
+        }
+        copyText(logText(), '日志')
+      }
     },
     {
       label: '清空',
@@ -5655,6 +5886,7 @@ function logDialog(): void {
       onClick: () => {
         logLines.length = 0
         view.textContent = '（暂无日志）'
+        toast('日志已清空')
       }
     },
     { label: '关闭', primary: true, onClick: closeModal }
@@ -5673,6 +5905,19 @@ function logDialog(): void {
  */
 function globalKeys(ev: KeyboardEvent): void {
   const target = ev.target as HTMLElement
+  // Ctrl+C copies whatever is selected, anywhere outside the terminal (the
+  // terminal handles its own copy). Without this, `ev.preventDefault()` below
+  // turns Ctrl+C into a no-op and the selection is lost.
+  if ((ev.ctrlKey || ev.metaKey) && !ev.shiftKey && !ev.altKey && ev.code === 'KeyC' &&
+      !target.closest?.('.term-box') && !['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) &&
+      window.getSelection()?.toString()) {
+    ev.preventDefault()
+    void navigator.clipboard.writeText(window.getSelection()!.toString()).then(
+      () => toast('已复制选中内容'),
+      (err: Error) => toast(`复制失败：${err.message}`, 'error')
+    )
+    return
+  }
   if (ev.key === 'Escape' && !$('#overlay').hidden) {
     closeModal()
     return
@@ -5742,7 +5987,8 @@ const SHORTCUTS: [string, string][] = [
   ['Ctrl + Tab / Ctrl + Shift + Tab', '切换标签'],
   ['Ctrl + 1 … 9', '跳到第 N 个标签'],
   ['Ctrl + Shift + W', '关闭当前标签'],
-  ['Ctrl + Shift + C / V', '复制 / 粘贴'],
+  ['Ctrl + Shift + C / V', '终端：复制 / 粘贴'],
+  ['Ctrl + C', '有选中内容时复制，否则中断当前命令'],
   ['Ctrl + Shift + F', '终端内查找'],
   ['Ctrl + Shift + B', '文件面板'],
   ['Ctrl + Shift + M', '资源监控'],

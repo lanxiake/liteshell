@@ -51,16 +51,12 @@ user-select: text;
 position: relative;
 }
 
+/* Only the interactive chrome opts out; anything with words on it stays
+   selectable so Ctrl+C copies what the user can read. */
 button,
-.tab,
-.node,
-.chip,
-.crumb,
 .theme-card,
 .icon-btn,
 .tbtn,
-.quickbar,
-.files-head,
 #titlebar {
   user-select: none;
 }
@@ -3128,6 +3124,65 @@ kbd {
 #menu div.danger:hover {
   background: var(--danger);
   color: #fff;
+}
+
+/* ---------- toast ---------- */
+
+/* Above the context menu and the modal backdrop: feedback for a click inside a
+   dialog has to be visible while that dialog is still open. */
+.toast-box {
+  position: fixed;
+  left: 50%;
+  bottom: 42px;
+  transform: translateX(-50%);
+  z-index: 200;
+  pointer-events: none;
+}
+
+.toast-box[hidden] {
+  display: none;
+}
+
+.toast {
+  padding: 7px 14px;
+  max-width: min(560px, 80vw);
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-panel) 92%, transparent);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 40%);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ok);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  animation: toast-in 0.16s ease-out;
+}
+
+.toast.tone-warn {
+  color: var(--warn);
+}
+
+.toast.tone-error {
+  color: var(--danger);
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* A button working on something says so, instead of looking ignored. */
+.btn.busy,
+.btn:disabled {
+  opacity: 0.65;
+  cursor: progress;
 }
 
 #menu hr {
